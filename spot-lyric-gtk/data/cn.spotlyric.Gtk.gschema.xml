@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="spot-lyric">
+  <schema id="cn.spotlyric.Gtk" path="/cn/spotlyric/Gtk/">
+
+    <!-- 主窗口 -->
+    <key name="window-width" type="i">
+      <default>620</default>
+      <summary>Preferences window width</summary>
+    </key>
+    <key name="window-height" type="i">
+      <default>720</default>
+      <summary>Preferences window height</summary>
+    </key>
+
+    <!-- 桌面歌词总开关 -->
+    <key name="desktop-lyrics-enabled" type="b">
+      <default>true</default>
+      <summary>Show the desktop lyrics overlay</summary>
+    </key>
+    <key name="desktop-lyrics-locked" type="b">
+      <default>false</default>
+      <summary>Whether the overlay is locked (click-through)</summary>
+    </key>
+
+    <!-- 浮层位置/尺寸 -->
+    <key name="desktop-lyrics-x" type="i">
+      <default>-1</default>
+      <summary>Saved window x; -1 = use default bottom-center</summary>
+    </key>
+    <key name="desktop-lyrics-y" type="i">
+      <default>-1</default>
+      <summary>Saved window y; -1 = use default bottom-center</summary>
+    </key>
+    <key name="desktop-lyrics-width" type="i">
+      <default>900</default>
+      <summary>Overlay width in px</summary>
+    </key>
+    <key name="desktop-lyrics-bottom-margin" type="i">
+      <default>80</default>
+      <summary>Default bottom margin from screen edge in px</summary>
+    </key>
+
+    <!-- 字体/排版 -->
+    <key name="desktop-lyrics-font" type="s">
+      <default>'HarmonyOS Sans SC Bold 32'</default>
+      <summary>Pango font description for the active line</summary>
+    </key>
+    <key name="desktop-lyrics-line-height" type="d">
+      <default>1.4</default>
+      <summary>Line height multiplier</summary>
+    </key>
+    <key name="desktop-lyrics-line-mode" type="s">
+      <choices>
+        <choice value="single"/>
+        <choice value="dual"/>
+      </choices>
+      <default>'dual'</default>
+      <summary>Line mode: single = active only; dual = active + next</summary>
+    </key>
+    <key name="desktop-lyrics-show-translation" type="b">
+      <default>true</default>
+      <summary>Show translation under the original lyric line</summary>
+    </key>
+
+    <!-- 颜色 -->
+    <key name="desktop-lyrics-active-color" type="s">
+      <default>'#5fd9ff'</default>
+      <summary>Active line color</summary>
+    </key>
+    <key name="desktop-lyrics-inactive-color" type="s">
+      <default>'#ffffff'</default>
+      <summary>Next/inactive line color</summary>
+    </key>
+    <key name="desktop-lyrics-stroke-color" type="s">
+      <default>'#000000'</default>
+      <summary>Text stroke color</summary>
+    </key>
+    <key name="desktop-lyrics-stroke-width" type="i">
+      <default>2</default>
+      <summary>Text stroke width in px</summary>
+    </key>
+    <key name="desktop-lyrics-bg-opacity" type="d">
+      <default>0.5</default>
+      <summary>Container background opacity (0.0 = transparent)</summary>
+    </key>
+    <key name="desktop-lyrics-bg-color" type="s">
+      <default>'#000000'</default>
+      <summary>Container background color (combined with opacity)</summary>
+    </key>
+
+    <!-- 歌词源（前端缓存；权威值在 daemon） -->
+    <key name="preferred-provider" type="s">
+      <choices>
+        <choice value="netease"/>
+        <choice value="qq"/>
+      </choices>
+      <default>'netease'</default>
+      <summary>Preferred lyrics provider</summary>
+    </key>
+    <key name="timing-offset-ms" type="i">
+      <default>0</default>
+      <summary>Lyrics timing offset (ms)</summary>
+    </key>
+  </schema>
+</schemalist>

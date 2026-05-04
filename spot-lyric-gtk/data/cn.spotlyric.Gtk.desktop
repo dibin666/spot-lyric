@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Spot-Lyric
+GenericName=Desktop Lyrics
+Comment=Display synchronized lyrics for Spotify on the desktop
+Comment[zh_CN]=Spotify 桌面歌词
+Exec=spot-lyric-gtk
+Icon=cn.spotlyric.Gtk
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=lyrics;spotify;karaoke;music;
+StartupNotify=true
+StartupWMClass=spot-lyric-gtk

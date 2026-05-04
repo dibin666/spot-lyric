@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="22" fill="url(#bg)"/>
+  <!-- Speech-bubble lyric sheet -->
+  <path d="M28 38 H100 A8 8 0 0 1 108 46 V82 A8 8 0 0 1 100 90 H72 L60 102 L60 90 H28 A8 8 0 0 1 20 82 V46 A8 8 0 0 1 28 38 Z"
+        fill="white" fill-opacity="0.96"/>
+  <!-- Lyric lines -->
+  <rect x="32" y="50" width="56" height="6" rx="3" fill="#1d4ed8" fill-opacity="0.9"/>
+  <rect x="32" y="62" width="44" height="5" rx="2.5" fill="#1d4ed8" fill-opacity="0.55"/>
+  <rect x="32" y="73" width="36" height="5" rx="2.5" fill="#1d4ed8" fill-opacity="0.35"/>
+  <!-- Note -->
+  <g transform="translate(86 48)" fill="#1d4ed8">
+    <ellipse cx="0" cy="22" rx="6.5" ry="5"/>
+    <rect x="5" y="0" width="3" height="22" rx="1"/>
+    <path d="M5 0 C 14 1 16 6 16 10 L 8 7 Z"/>
+  </g>
+</svg>

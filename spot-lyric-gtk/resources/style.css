@@ -1,0 +1,92 @@
+/* Spot-Lyric GTK style overrides — libadwaita handles base theming */
+
+/* ─── Global ─── */
+window {
+  font-family: "HarmonyOS Sans SC", "Noto Sans CJK SC", "Source Han Sans SC",
+               "HarmonyOS Sans", "Montserrat", sans-serif;
+}
+
+/* ─── Preferences window ─── */
+.spotlyric-banner-error {
+  background-color: alpha(@error_bg_color, 0.9);
+  color: @error_fg_color;
+}
+
+.spotlyric-status-dot {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  margin-right: 6px;
+}
+.spotlyric-status-dot.idle      { background-color: alpha(@window_fg_color, 0.4); }
+.spotlyric-status-dot.refreshing{ background-color: @warning_color; }
+.spotlyric-status-dot.ready     { background-color: @success_color; }
+.spotlyric-status-dot.error     { background-color: @error_color; }
+
+.spotlyric-mono {
+  font-family: monospace;
+  font-feature-settings: "tnum";
+}
+
+/* ─── Desktop lyrics overlay ─── */
+.desktop-lyrics-window {
+  background: transparent;
+}
+
+.desktop-lyrics-container {
+  border-radius: 16px;
+  padding: 14px 32px;
+  transition: background-color 200ms ease;
+}
+
+.desktop-lyrics-active {
+  font-weight: 700;
+  transition: color 250ms ease;
+}
+
+.desktop-lyrics-next {
+  font-weight: 400;
+  opacity: 0.65;
+}
+
+.desktop-lyrics-translation {
+  font-weight: 500;
+  opacity: 0.85;
+}
+
+.drag-handle {
+  min-width: 48px;
+  min-height: 4px;
+  border-radius: 2px;
+  background-color: alpha(white, 0.35);
+  margin-top: 6px;
+}
+
+/* ─── Lyrics match dialog ─── */
+.lyrics-match-row {
+  padding: 6px 4px;
+}
+
+.lyrics-match-row .candidate-meta {
+  opacity: 0.7;
+  font-size: 0.92em;
+}
+
+.lyrics-match-provider-tag {
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.78em;
+  font-weight: 600;
+  background-color: alpha(@accent_bg_color, 0.18);
+  color: @accent_color;
+}
+.lyrics-match-provider-tag.qq {
+  background-color: alpha(@warning_color, 0.18);
+  color: @warning_color;
+}
+
+/* ─── Auth dialog ─── */
+.auth-dialog-text {
+  font-family: monospace;
+  font-size: 0.9em;
+}
