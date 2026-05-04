@@ -1,0 +1,10 @@
+.claude/
+cookie.txt
+spot-lyric-gtk/data/gschemas.compiled
+
+/target/
+**/target/
+**/*.rs.bk
+*.swp
+.idea/
+.vscode/
