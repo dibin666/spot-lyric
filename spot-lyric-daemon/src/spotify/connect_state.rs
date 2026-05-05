@@ -30,6 +30,7 @@ const PLAYER_API_BASE: &str = "https://api.spotify.com/v1/me/player";
 const CURRENTLY_PLAYING_API: &str = "https://api.spotify.com/v1/me/player/currently-playing";
 const WEB_PLAYER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CACHED_PLAYING_EXTRAPOLATION: Duration = Duration::from_secs(3);
+const MAX_TIMESTAMP_POSITION_EXTRAPOLATION: Duration = Duration::from_secs(3);
 const WEB_PLAYER_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 const CONNECT_STATE_ERROR_BACKOFF: Duration = Duration::from_secs(60);
 const DEALER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,7 +90,10 @@ impl PlaybackFallbackState {
         let mut snapshot = cached.snapshot.clone();
         if snapshot.state.is_playing {
             let elapsed = now.saturating_duration_since(cached.observed_at);
-            let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+            let elapsed_ms = elapsed
+                .min(MAX_CACHED_PLAYING_EXTRAPOLATION)
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
             snapshot.state.position_ms = snapshot.state.position_ms.saturating_add(elapsed_ms);
             if snapshot.state.duration_ms > 0 {
                 snapshot.state.position_ms =
@@ -879,7 +883,8 @@ fn correct_position_for_timestamp(
             let elapsed_ms = chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(timestamp)
-                .max(0);
+                .max(0)
+                .min(MAX_TIMESTAMP_POSITION_EXTRAPOLATION.as_millis() as i64);
             corrected = corrected.saturating_add(elapsed_ms);
         }
     }
@@ -891,13 +896,25 @@ fn correct_position_for_timestamp(
 }
 
 fn player_is_playing(player: &Value) -> bool {
+    let speed = first_f64(player, &["playback_speed"]);
+    if matches!(speed, Some(speed) if speed <= 0.0) {
+        return false;
+    }
+
+    let is_paused = first_bool(player, &["is_paused", "paused"]);
+    if matches!(is_paused, Some(true)) {
+        return false;
+    }
+
     if let Some(is_playing) = first_bool(player, &["is_playing", "playing"]) {
         return is_playing;
     }
-    if let Some(is_paused) = first_bool(player, &["is_paused", "paused"]) {
-        return !is_paused;
+
+    if matches!(is_paused, Some(false)) {
+        return true;
     }
-    if let Some(speed) = first_f64(player, &["playback_speed"]) {
+
+    if let Some(speed) = speed {
         return speed > 0.0;
     }
     false
@@ -1116,6 +1133,54 @@ mod tests {
     }
 
     #[test]
+    fn playback_speed_zero_overrides_stale_connect_playing_flags() {
+        let raw = json!({
+            "player_state": {
+                "is_playing": true,
+                "is_paused": false,
+                "playback_speed": 0,
+                "timestamp": chrono::Utc::now().timestamp_millis() - 10_000,
+                "position_as_of_timestamp": 12_345,
+                "duration": 180_000,
+                "track": {
+                    "gid": "00000000000000000000000000000001",
+                    "metadata": {
+                        "title": "Paused Song",
+                        "artist_name": "Artist"
+                    }
+                }
+            }
+        });
+
+        let snapshot = map_connect_state_response(&raw).expect("snapshot");
+
+        assert!(!snapshot.state.is_playing);
+        assert_eq!(snapshot.state.position_ms, 12_345);
+    }
+
+    #[test]
+    fn playback_speed_zero_overrides_stale_web_player_flags() {
+        let raw = json!({
+            "timestamp": chrono::Utc::now().timestamp_millis() - 10_000,
+            "progress_ms": 42_000,
+            "is_playing": true,
+            "playback_speed": 0,
+            "item": {
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Paused Web Song",
+                "duration_ms": 213_000,
+                "artists": [{ "name": "Rick Astley" }]
+            }
+        });
+
+        let snapshot = map_web_player_response(&raw).expect("snapshot");
+
+        assert!(!snapshot.state.is_playing);
+        assert_eq!(snapshot.state.position_ms, 42_000);
+    }
+
+    #[test]
     fn web_player_position_uses_timestamp_when_playing() {
         let raw = json!({
             "timestamp": chrono::Utc::now().timestamp_millis() - 1_000,
@@ -1136,6 +1201,31 @@ mod tests {
         assert!(
             (42_900..=43_300).contains(&snapshot.state.position_ms),
             "timestamp-corrected position should include elapsed time, got {}",
+            snapshot.state.position_ms
+        );
+    }
+
+    #[test]
+    fn playing_position_caps_stale_timestamp_extrapolation() {
+        let raw = json!({
+            "timestamp": chrono::Utc::now().timestamp_millis() - 30_000,
+            "progress_ms": 42_000,
+            "is_playing": true,
+            "item": {
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Seeked Song",
+                "duration_ms": 213_000,
+                "artists": [{ "name": "Rick Astley" }]
+            }
+        });
+
+        let snapshot = map_web_player_response(&raw).expect("snapshot");
+
+        assert!(snapshot.state.is_playing);
+        assert!(
+            (44_500..=45_500).contains(&snapshot.state.position_ms),
+            "stale timestamp correction should be capped, got {}",
             snapshot.state.position_ms
         );
     }
@@ -1185,7 +1275,7 @@ mod tests {
                 },
                 observed_at: Instant::now()
                     - MAX_CACHED_PLAYING_EXTRAPOLATION
-                    - Duration::from_millis(100),
+                    - Duration::from_secs(5),
             }),
         };
 
@@ -1194,7 +1284,11 @@ mod tests {
             .expect("snapshot");
 
         assert!(!snapshot.state.is_playing);
-        assert!(snapshot.state.position_ms >= 4_000);
+        assert!(
+            (4_000..=4_100).contains(&snapshot.state.position_ms),
+            "stale cached fallback should cap extrapolated position, got {}",
+            snapshot.state.position_ms
+        );
     }
 
     #[test]

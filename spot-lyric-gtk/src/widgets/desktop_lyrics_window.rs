@@ -824,6 +824,10 @@ impl DesktopLyricsWindow {
             if let Some(next) = imp.next_label.borrow().as_ref() {
                 next.set_text("");
             }
+        } else {
+            // Render the daemon snapshot immediately so pause/resume/seek events
+            // do not wait for the next interpolation tick.
+            self.update_active_line(state.position_ms);
         }
     }
 
