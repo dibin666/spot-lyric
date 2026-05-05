@@ -1,4 +1,4 @@
-//! Generated zbus proxies for the daemon side service.
+//! Generated zbus proxies for the integrated backend service.
 //!
 //! Service name / object path / method signatures match
 //! `backend-integration.md` §3 verbatim.
@@ -71,21 +71,7 @@ pub mod lyrics {
     }
 }
 
-pub mod app {
-    use zbus::proxy;
-
-    #[proxy(
-        interface = "cn.spotlyric.App",
-        default_service = "cn.spotlyric.Daemon",
-        default_path = "/cn/spotlyric/Daemon"
-    )]
-    pub trait SpotLyricApp {
-        async fn quit(&self) -> zbus::Result<()>;
-    }
-}
-
 // Re-exports
-pub use app::SpotLyricAppProxy;
 pub use auth::SpotLyricAuthProxy;
 pub use lyrics::SpotLyricLyricsProxy;
 pub use playback::SpotLyricPlaybackProxy;
@@ -96,7 +82,6 @@ pub struct DaemonClient {
     pub auth: SpotLyricAuthProxy<'static>,
     pub playback: SpotLyricPlaybackProxy<'static>,
     pub lyrics: SpotLyricLyricsProxy<'static>,
-    pub app: SpotLyricAppProxy<'static>,
 }
 
 impl DaemonClient {
@@ -106,7 +91,6 @@ impl DaemonClient {
             auth: SpotLyricAuthProxy::new(&conn).await?,
             playback: SpotLyricPlaybackProxy::new(&conn).await?,
             lyrics: SpotLyricLyricsProxy::new(&conn).await?,
-            app: SpotLyricAppProxy::new(&conn).await?,
         })
     }
 }

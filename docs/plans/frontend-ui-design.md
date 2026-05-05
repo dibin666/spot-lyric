@@ -1,6 +1,6 @@
 # Spot-Lyric 前端 UI 设计方案
 
-> **范围**：本文档只定义 GTK 前端（`spot-lyric-gtk`）的视觉设计、组件结构、交互、构建与配置。后端的所有职责见 `backend-integration.md`，前后端通过 D-Bus 通信。
+> **范围**：本文档定义 GTK 单进程应用（`spot-lyric-gtk`）的视觉设计、组件结构、交互、构建与配置。后端运行在同一进程内；前端桥接层仍通过本进程拥有的 D-Bus 服务拉取/订阅业务状态。
 
 ---
 
@@ -16,10 +16,10 @@
 - **X11 一等公民**。所有"始终置顶 / 点击穿透 / 拖动 / 工作区无关位置"全部走 X11 EWMH 协议（`_NET_WM_STATE_ABOVE`、`SHAPE input region`、`XMoveWindow`），不依赖任何 Wayland / layer-shell 协议。
 - 在没有合成器（picom / compton / mutter）时仍能用，仅"半透明"会退化为不透明背景。
 
-### 1.3 与后端的边界
+### 1.3 与内置后端的边界
 - **前端只持有 UI 状态和用户偏好**（GSettings 中的字体、颜色、窗口位置等）。
-- **后端持有播放状态、登录态、歌词数据**。前端通过 D-Bus 拉取/订阅。
-- 后端无法启动时，前端进入"降级模式"：托盘菜单中只可改样式 / 看 about / 退出，主窗口顶部显示连接错误条。
+- **内置后端持有播放状态、登录态、歌词数据**。前端 bridge 通过 D-Bus proxy 拉取/订阅，保持 UI 与业务逻辑解耦。
+- 内置后端启动失败时，前端进入“降级模式”：托盘菜单中只可改样式 / 看 about / 退出，主窗口顶部显示连接错误条。
 
 ---
 
@@ -40,14 +40,15 @@ spot-lyric-gtk/
 │   └── style.css                         ← 自定义 CSS 覆盖
 └── src/
     ├── main.rs                           ← 入口 + 资源注册 + 日志
+    ├── backend_runtime.rs                ← 内置后端线程 + Tokio runtime 生命周期
     ├── application.rs                    ← SpotLyricApplication (adw::Application)
     ├── config.rs                         ← APP_ID / 常量
-    ├── bridge/                           ← UI ↔ D-Bus 桥
+    ├── bridge/                           ← UI ↔ 内置后端 D-Bus 桥
     │   ├── mod.rs
     │   ├── controller.rs                 ← tokio 运行时 + 命令循环
     │   ├── commands.rs                   ← Command enum
     │   └── updates.rs                    ← UiUpdate enum
-    ├── dbus/                             ← D-Bus 客户端代理
+    ├── dbus/                             ← 本进程后端 D-Bus 客户端代理
     │   ├── mod.rs
     │   ├── client.rs                     ← #[zbus::proxy] 定义
     │   └── types.rs                      ← 跨 D-Bus 序列化类型
@@ -125,13 +126,13 @@ glib-build-tools = "0.20"
 1. 安装 panic hook，将 backtrace 打到 stderr。
 2. 初始化 `tracing_subscriber`（默认 `spot_lyric_gtk=info`，受 `RUST_LOG` 控制）。
 3. 注册 GResource `spot_lyric.gresource`。
-4. 构造 `SpotLyricApplication`，调用 `app.run()`。
+4. 创建 `BackendRuntime`，注入 `SpotLyricApplication`，调用 `app.run()`。
 
 ### 4.2 `SpotLyricApplication`（`application.rs`）
 - 派生自 `adw::Application`，APP_ID = `cn.spotlyric.Gtk`。
 - `startup` 钩子：
   1. 加载 `style.css` 到 default display 的 `StyleProvider`（`USER` 优先级）。
-  2. 启动 `bridge::Controller`（D-Bus 桥），返回 `cmd_tx` 与 `ui_rx`。
+  2. 启动 `bridge::Controller`（D-Bus 桥），由它确保 `BackendRuntime` 已启动并返回 `cmd_tx` 与 `ui_rx`。
   3. 启动 `tray::StatusNotifierTray`，与 `cmd_tx`、`ui_rx` 共享通道（见 §8）。
   4. **`app.hold()` 手动持有引用**，让所有 GTK 窗口都关闭后进程仍存活（等托盘菜单触发 Quit 才走 `app.release()` + `app.quit()`）。
 - `activate` 钩子：
@@ -219,7 +220,7 @@ pub enum UiUpdate {
 ```
 
 ### 5.4 D-Bus 代理（`dbus/client.rs`）
-所有方法都对应 `cn.spotlyric.Daemon` 服务下的接口（详见 `backend-integration.md` §3）。前端不感知后端实现，只调用 proxy。每个接口一个独立 `mod`，避免 `StateChangedArgs` 等生成名冲突。
+所有方法都对应本进程拥有的 `cn.spotlyric.Daemon` 服务下的接口（详见 `backend-integration.md` §3）。前端不感知后端是否跨进程，只调用 proxy。每个接口一个独立 `mod`，避免 `StateChangedArgs` 等生成名冲突。
 
 ```rust
 pub struct DaemonClient {
@@ -312,7 +313,7 @@ pub struct DaemonClient {
 - Tooltip:
   - 已连接 + 在播：`{track} — {artist}`
   - 已连接 + 暂停：`{track} (paused)`
-  - 未连接：`spot-lyric-daemon 未运行`
+  - 未连接：`后端未运行`
 
 ### 8.3 菜单
 ```
@@ -620,7 +621,7 @@ fn realize_x11(&self) {
 
 | 场景 | UI 反馈 |
 |---|---|
-| daemon 未启动 | 主窗 banner 红色"未连接到 spot-lyric-daemon"，提供"重试"按钮，托盘 tooltip 提示"daemon 未运行" |
+| 内置后端启动失败 | 主窗 banner 红色“未连接到内置后端”，提供“重试”按钮，托盘 tooltip 提示“后端未运行” |
 | cookie 过期 | 黄色 banner，提供"重新导入" |
 | 歌词 404 | 桌面歌词显示"♪ {track} — {artist}"，主窗弹 toast"未找到此曲歌词，可手动匹配" |
 | 歌词加载报错 | 错误 toast，桌面歌词保持上一首/空 |

@@ -34,7 +34,4 @@ pub enum Command {
     ImportCookieString(String),
     RefreshAuth,
     ClearCookie,
-
-    // ── Lifecycle
-    QuitDaemon,
 }

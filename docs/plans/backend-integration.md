@@ -1,17 +1,17 @@
 # Spot-Lyric 后端集成方案
 
-> 本文是给**实现 `spot-lyric-daemon`** 的工程师/AI 看的。前端（`spot-lyric-gtk`）已按 `frontend-ui-design.md` 写好；本文档定义两件事：
+> 本文是给实现 Spot-Lyric **内置后端库**（当前 crate 仍名为 `spot-lyric-daemon`）的工程师/AI 看的。GTK 程序启动时在同一进程内启动后端运行时；前端桥接层仍通过本进程拥有的 D-Bus 名称访问后端。本文件定义两件事：
 >
 > 1. **如何从参考工程 `~/work/sporify-client/spol-daemon` 抽取所需逻辑**（到行号级）
-> 2. **D-Bus 接口契约**（前端拿这个 spec 直接写代理；后端按这个 spec 实现服务）
+> 2. **D-Bus 接口契约**（GTK 进程内的后端服务按这个 spec 暴露接口；前端代理按这个 spec 调用）
 >
-> **强约束**：D-Bus 名称、接口、对象路径、方法签名、信号字段在前端代码里都已经定死；后端必须**精确**按本文实现，否则前端不工作。
+> **强约束**：D-Bus 名称、接口、对象路径、方法签名、信号字段在前端代码里都已经定死；内置后端必须**精确**按本文实现，否则前端不工作。
 
 ---
 
 ## 1. 总体职责
 
-后端独立进程 `spot-lyric-daemon`：
+后端作为 `spot-lyric-gtk` 的内置运行时（复用 `spot-lyric-daemon` 库 crate）：
 
 1. **Spotify 网页版逆向认证**：从用户提供的 cookie（含 `sp_dc`）走 TOTP 协议拿到 `access_token` + `client_token`。
 2. **拉取播放状态**：通过 Spotify Web 内部 API（不走 OAuth 公共 API），实时（≤2 秒延迟）汇报当前曲目、位置、是否在播。
@@ -28,7 +28,6 @@
 spot-lyric-daemon/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs                       # 进程入口 + DBus 注册
 │   ├── lib.rs
 │   ├── config.rs                     # 路径常量、轮询间隔等
 │   ├── error.rs                      # DaemonError + Result
@@ -64,11 +63,10 @@ spot-lyric-daemon/
 │   │
 │   ├── dbus/
 │   │   ├── mod.rs
-│   │   ├── server.rs                 # 绑定 cn.spotlyric.Daemon 总线名
+│   │   ├── server.rs                 # 在 GTK 进程内绑定 cn.spotlyric.Daemon 总线名
 │   │   ├── auth_iface.rs             # cn.spotlyric.Auth
 │   │   ├── playback_iface.rs         # cn.spotlyric.Playback
 │   │   ├── lyrics_iface.rs           # cn.spotlyric.Lyrics
-│   │   └── app_iface.rs              # cn.spotlyric.App
 │   │
 │   └── types/
 │       ├── mod.rs
@@ -76,8 +74,6 @@ spot-lyric-daemon/
 │       ├── playback.rs               # PlaybackState
 │       └── lyrics.rs                 # LyricsPayload, LyricsCandidate, ...
 │
-└── data/
-    └── cn.spotlyric.Daemon.service.in    # systemd user unit
 ```
 
 `★` = 几乎可以直接复制粘贴的文件
@@ -241,13 +237,9 @@ SettingsChanged(settings:s)            # JSON of LyricsSettings
 }
 ```
 
-### 3.4 接口 `cn.spotlyric.App`
+### 3.4 应用生命周期
 
-```text
-Quit()                           → ()
-```
-
-调用后 daemon 立即开始优雅退出（保存状态、断开 WebSocket、释放 cookie）。
+不再暴露 `cn.spotlyric.App.Quit`。GTK 应用退出时直接调用 `BackendRuntime::shutdown()`，后端停止 playback 轮询、释放 D-Bus 名称并完成本地状态收尾。
 
 ---
 
@@ -452,67 +444,48 @@ pub fn db_path() -> PathBuf { data_dir().join("spot-lyric.db") }
 
 ---
 
-## 6. 进程生命周期 / systemd
+## 6. 单进程生命周期
 
-### 6.1 `data/cn.spotlyric.Daemon.service.in`
+### 6.1 启动边界
 
-```ini
-[Unit]
-Description=Spot-Lyric daemon (Spotify lyrics overlay backend)
-After=network-online.target
-
-[Service]
-Type=dbus
-BusName=cn.spotlyric.Daemon
-ExecStart=@bindir@/spot-lyric-daemon
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-```
-
-> 启动时用 `dbus-daemon` 自动激活也可以（在 `/usr/share/dbus-1/services/cn.spotlyric.Daemon.service` 里 `Exec=` 指向二进制即可），那样前端在 `connect()` 时会自动起 daemon。
+不再安装或启动单独的 `spot-lyric-daemon` 程序，也不再提供 systemd/dbus activation unit。`spot-lyric-gtk` 是唯一需要启动的程序。
 
 ### 6.2 启动流程
 
-```
-main()
- ├─ parse_args (--data-dir override)
- ├─ tracing 初始化
- ├─ 打开 SQLite → 跑 migration
- ├─ 创建 reqwest::Client（rustls + cookie 不持久化）
- ├─ DiscoveryService::new + 预热 apresolve
- ├─ ProtocolRegistry::default
- ├─ AuthService::new(...) → 内部 try refresh
- ├─ SpotifyTransport::new(auth, client, protocol)
- ├─ ConnectStateClient::new
- ├─ NeteaseLyricsClient + QqMusicLyricsClient
- ├─ LyricsStore + LyricsDomain
- ├─ PlaybackDomain::spawn(...) → 后台轮询
- ├─ DBus 服务注册：
- │     ├─ cn.spotlyric.Auth
- │     ├─ cn.spotlyric.Playback
- │     ├─ cn.spotlyric.Lyrics
- │     └─ cn.spotlyric.App
- ├─ 注册 SIGINT / SIGTERM 处理器 → 清理流程
- └─ park 主线程
+```text
+spot-lyric-gtk main()
+ ├─ GTK/tracing/GResource/GSettings 初始化
+ ├─ 创建 BackendRuntime
+ ├─ GTK Application::startup 创建 bridge worker
+ ├─ bridge worker 调用 BackendRuntime::ensure_running()
+ │   ├─ 创建 spot-lyric-backend 线程 + Tokio runtime
+ │   ├─ AppState::bootstrap(data_dir override from SPOT_LYRIC_DATA_DIR)
+ │   ├─ 打开 SQLite → 跑 migration
+ │   ├─ 创建 reqwest::Client（rustls + cookie 不持久化）
+ │   ├─ DiscoveryService::new + 预热 apresolve
+ │   ├─ AuthService / SpotifyTransport / ConnectStateClient
+ │   ├─ NeteaseLyricsClient + QqMusicLyricsClient
+ │   ├─ LyricsStore + LyricsDomain
+ │   ├─ PlaybackDomain::spawn(...) → 后台轮询
+ │   └─ D-Bus 服务注册：
+ │       ├─ cn.spotlyric.Auth
+ │       ├─ cn.spotlyric.Playback
+ │       └─ cn.spotlyric.Lyrics
+ └─ 前端 bridge 连接本进程拥有的 cn.spotlyric.Daemon
 ```
 
 ### 6.3 退出
 
-收到 `App.Quit()` 或信号：
-1. PlaybackDomain 停止轮询。
-2. 关闭 dealer WebSocket（如果开了）。
-3. SQLite checkpoint。
-4. DBus 注销。
-5. 进程结束。
-
+GTK 应用退出：
+1. `BackendRuntime::shutdown()` 通知内置后端停止。
+2. PlaybackDomain 停止轮询。
+3. 关闭 dealer WebSocket（如果开了）。
+4. DBus 连接释放，`cn.spotlyric.Daemon` 总线名消失。
 ---
 
 ## 7. 错误处理 / 边界
 
-| 场景 | daemon 行为 | 前端可见 |
+| 场景 | 内置后端行为 | 前端可见 |
 |---|---|---|
 | 没有 cookie | `auth.status="idle"` | 主窗 banner"未登录" |
 | cookie 过期（连续刷新失败 3 次） | `auth.status="error"`, error="Cookie expired" | banner"登录已过期" |
@@ -540,7 +513,7 @@ main()
 
 - **Auth flow**：用一个 `mockito` server 模拟 `/api/token` + `/clienttoken` + `/apresolve`，验证 `AuthService::refresh` 拿到 access_token。
 - **Connect-state**：mockito 返回固定 player_state JSON，验证 `PlaybackDomain` 在 2s 内推出 `PlaybackState`。
-- **DBus**：起一个内存 `zbus::Connection`（session bus 测试模式），mount Auth/Playback/Lyrics/App 接口，从客户端发 `GetTrackLyrics(uri)`，断言返回的 JSON 字段正确。
+- **DBus**：起测试 session bus，mount Auth/Playback/Lyrics 接口，从客户端发 `GetTrackLyrics(uri)`，断言返回的 JSON 字段正确。
 
 ---
 
@@ -556,7 +529,7 @@ main()
 - [ ] `Lyrics.SearchManualMatches("Counting Stars OneRepublic")` 返回至少 5 条 candidate。
 - [ ] `Lyrics.SaveManualMatch(...)` 后再调 `GetTrackLyrics` 用的就是绑定的 candidate（验证：candidate provider == 用户选的）。
 - [ ] `Lyrics.SetPreferredProvider("qq")` 后，`SettingsChanged` 信号被推出，且新一首歌的搜索结果 QQ provider 排在前。
-- [ ] `App.Quit()` 后 `cn.spotlyric.Daemon` 总线名 5 秒内消失。
+- [ ] GTK 应用退出后 `cn.spotlyric.Daemon` 总线名 5 秒内消失。
 
 ---
 
@@ -568,7 +541,7 @@ main()
 4. **Connect-state**：实现 `fetch_state` PUT，跑通真实播放状态。
 5. **Saved match + persistence**：SQLite 表、settings、saved_match 流。
 6. **Dealer WebSocket（可选）**：低延迟切歌。
-7. **systemd unit + 自动启动**。
+7. **内置运行时启动/退出联调**。
 
 ---
 

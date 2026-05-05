@@ -1,7 +1,7 @@
 mod application;
+mod backend_runtime;
 mod bridge;
 mod config;
-mod daemon_launcher;
 mod dbus;
 mod dialogs;
 mod platform;
@@ -32,12 +32,10 @@ fn main() -> glib::ExitCode {
     gio::resources_register_include!("spot_lyric.gresource")
         .expect("Failed to register GResource bundle");
 
-    let daemon_supervisor = daemon_launcher::DaemonSupervisor::default();
-    daemon_supervisor.ensure_running_blocking();
-
-    let app = application::SpotLyricApplication::new(daemon_supervisor.clone());
+    let backend_runtime = backend_runtime::BackendRuntime::default();
+    let app = application::SpotLyricApplication::new(backend_runtime.clone());
     let exit_code = app.run();
-    daemon_supervisor.shutdown();
+    backend_runtime.shutdown();
     exit_code
 }
 

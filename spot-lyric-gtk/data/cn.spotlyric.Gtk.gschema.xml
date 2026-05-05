@@ -88,7 +88,7 @@
       <summary>Container background color (combined with opacity)</summary>
     </key>
 
-    <!-- 歌词源（前端缓存；权威值在 daemon） -->
+    <!-- 歌词源（前端缓存；权威值在内置后端） -->
     <key name="preferred-provider" type="s">
       <choices>
         <choice value="netease"/>

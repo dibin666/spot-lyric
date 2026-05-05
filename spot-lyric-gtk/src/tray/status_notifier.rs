@@ -92,7 +92,7 @@ impl Tray for StatusNotifierTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let state = self.state.lock().unwrap();
         let desc = if !state.connected {
-            "spot-lyric-daemon 未运行".to_string()
+            "后端未运行".to_string()
         } else if let Some(ref np) = state.now_playing {
             if state.is_playing {
                 np.clone()

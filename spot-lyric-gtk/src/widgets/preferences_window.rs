@@ -743,7 +743,7 @@ impl PreferencesWindow {
         if connected {
             self.hide_banner();
         } else {
-            self.show_banner("未连接到 spot-lyric-daemon", Some("重试"));
+            self.show_banner("未连接到内置后端", Some("重试"));
         }
     }
 }

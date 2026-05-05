@@ -1,4 +1,3 @@
-pub mod app_iface;
 pub mod auth_iface;
 pub mod lyrics_iface;
 pub mod playback_iface;

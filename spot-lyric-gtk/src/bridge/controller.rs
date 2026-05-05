@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 
 use super::commands::Command;
 use super::updates::UiUpdate;
+use crate::backend_runtime::BackendRuntime;
 use crate::config;
-use crate::daemon_launcher::DaemonSupervisor;
 use crate::dbus::client::DaemonClient;
 use crate::dbus::types::{
     AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackState,
@@ -25,7 +25,7 @@ pub struct Bridge {
 impl Bridge {
     /// Spawn the worker thread. Returns a command channel and a `std::mpsc`
     /// receiver of UI updates suitable for polling from the glib main loop.
-    pub fn start(daemon_supervisor: DaemonSupervisor) -> (Self, std_mpsc::Receiver<UiUpdate>) {
+    pub fn start(backend_runtime: BackendRuntime) -> (Self, std_mpsc::Receiver<UiUpdate>) {
         let (ui_tx, ui_rx) = std_mpsc::channel::<UiUpdate>();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
 
@@ -36,7 +36,7 @@ impl Bridge {
                     .enable_all()
                     .build()
                     .expect("tokio runtime for bridge");
-                runtime.block_on(run_bridge(ui_tx, cmd_rx, daemon_supervisor));
+                runtime.block_on(run_bridge(ui_tx, cmd_rx, backend_runtime));
             })
             .expect("spawn bridge thread");
 
@@ -64,18 +64,29 @@ struct Holdings {
 async fn run_bridge(
     ui_tx: UiSender,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
-    daemon_supervisor: DaemonSupervisor,
+    backend_runtime: BackendRuntime,
 ) {
     let holdings = Arc::new(Holdings::default());
 
     // Reconnect loop: repeatedly attempt to connect; once connected, run the
     // command/signal pump until the connection drops, then go back to retry.
     loop {
-        daemon_supervisor.ensure_running().await;
+        if let Err(error) = backend_runtime.ensure_running() {
+            let message = format!("integrated backend unavailable: {error}");
+            warn!("{message}");
+            let _ = ui_tx.send(UiUpdate::Disconnected(message));
+            if !wait_for_reconnect(&mut cmd_rx).await {
+                return;
+            }
+            continue;
+        }
         match DaemonClient::connect().await {
             Ok(client) => {
                 let _ = ui_tx.send(UiUpdate::Connected);
-                info!("Connected to {}", config::DAEMON_BUS_NAME);
+                info!(
+                    "Connected to integrated backend over {}",
+                    config::DAEMON_BUS_NAME
+                );
 
                 // Spawn signal listeners (they hold weak refs to the client)
                 spawn_auth_signal(client.clone(), ui_tx.clone());
@@ -179,12 +190,6 @@ async fn run_command_loop(
             }
             Command::RefreshAuth => refresh_auth(client, ui_tx).await,
             Command::ClearCookie => clear_cookie(client, ui_tx).await,
-
-            Command::QuitDaemon => {
-                if let Err(error) = client.app.quit().await {
-                    report_error(ui_tx, error.to_string());
-                }
-            }
         }
     }
     Ok(())

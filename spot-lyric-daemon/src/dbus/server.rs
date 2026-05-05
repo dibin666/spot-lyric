@@ -6,8 +6,8 @@ use crate::{
     app_state::AppState,
     config::{DBUS_BUS_NAME, DBUS_OBJECT_PATH},
     dbus::{
-        app_iface::AppIface, auth_iface::AuthIface, lyrics_iface::LyricsIface,
-        playback_iface::PlaybackIface, to_json_reply,
+        auth_iface::AuthIface, lyrics_iface::LyricsIface, playback_iface::PlaybackIface,
+        to_json_reply,
     },
     error::Result,
 };
@@ -31,7 +31,6 @@ pub async fn serve_dbus(state: AppState) -> Result<DbusRuntime> {
         .serve_at(DBUS_OBJECT_PATH, AuthIface::new(state.clone()))?
         .serve_at(DBUS_OBJECT_PATH, PlaybackIface::new(state.clone()))?
         .serve_at(DBUS_OBJECT_PATH, LyricsIface::new(state.clone()))?
-        .serve_at(DBUS_OBJECT_PATH, AppIface::new(state.clone()))?
         .build()
         .await?;
 

@@ -3,10 +3,11 @@ name = "spot-lyric-gtk"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Desktop lyrics overlay for Spotify (GTK4 frontend)"
+description = "Desktop lyrics overlay for Spotify with an in-process backend"
 license = "MIT"
 
 [dependencies]
+spot-lyric-daemon = { path = "../spot-lyric-daemon" }
 gtk         = { package = "gtk4", version = "0.9", features = ["v4_14"] }
 adw         = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 glib        = "0.20"
@@ -25,7 +26,6 @@ futures-util = "0.3"
 ksni        = "0.2"
 x11rb       = { version = "0.13", features = ["allow-unsafe-code", "shape", "randr"] }
 anyhow      = "1"
-libc        = "0.2"
 
 [build-dependencies]
 glib-build-tools = "0.20"

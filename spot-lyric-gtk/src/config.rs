@@ -3,9 +3,8 @@
 /// GApplication / GSettings / GResource ID
 pub const APP_ID: &str = "cn.spotlyric.Gtk";
 
-/// Daemon side D-Bus identity (must match `backend-integration.md` §3)
+/// In-process backend D-Bus identity (kept stable for GTK bridge proxies)
 pub const DAEMON_BUS_NAME: &str = "cn.spotlyric.Daemon";
-pub const DAEMON_OBJECT_PATH: &str = "/cn/spotlyric/Daemon";
 
 /// UI tick rate for client-side playback position interpolation.
 pub const POSITION_TICK_MS: u64 = 40;

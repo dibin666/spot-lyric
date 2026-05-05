@@ -4,9 +4,9 @@ use gtk::{gio, glib};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::backend_runtime::BackendRuntime;
 use crate::bridge;
 use crate::config;
-use crate::daemon_launcher::DaemonSupervisor;
 use crate::tray;
 use crate::widgets::{
     desktop_lyrics_window::DesktopLyricsWindow, preferences_window::PreferencesWindow,
@@ -38,7 +38,7 @@ mod imp {
         pub desktop_lyrics: RefCell<Option<DesktopLyricsWindow>>,
         pub tray_state: std::sync::Arc<std::sync::Mutex<tray::TrayState>>,
         pub tray_handle: Rc<RefCell<Option<tray::TrayHandle>>>,
-        pub daemon_supervisor: RefCell<DaemonSupervisor>,
+        pub backend_runtime: RefCell<BackendRuntime>,
         pub hold_guard: RefCell<Option<gio::ApplicationHoldGuard>>,
         pub desktop_settings: RefCell<Option<gio::Settings>>,
         pub desktop_settings_handler: RefCell<Option<glib::SignalHandlerId>>,
@@ -51,7 +51,7 @@ mod imp {
                 desktop_lyrics: RefCell::new(None),
                 tray_state: std::sync::Arc::new(std::sync::Mutex::new(tray::TrayState::default())),
                 tray_handle: Rc::new(RefCell::new(None)),
-                daemon_supervisor: RefCell::new(DaemonSupervisor::default()),
+                backend_runtime: RefCell::new(BackendRuntime::default()),
                 hold_guard: RefCell::new(None),
                 desktop_settings: RefCell::new(None),
                 desktop_settings_handler: RefCell::new(None),
@@ -85,7 +85,7 @@ mod imp {
             }
 
             // 2. Start bridge
-            let (cmd_tx, ui_rx) = bridge::Bridge::start(self.daemon_supervisor.borrow().clone());
+            let (cmd_tx, ui_rx) = bridge::Bridge::start(self.backend_runtime.borrow().clone());
 
             // 3. Start tray
             let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -208,7 +208,7 @@ mod imp {
         }
 
         fn shutdown(&self) {
-            self.daemon_supervisor.borrow().shutdown();
+            self.backend_runtime.borrow().shutdown();
             if let (Some(settings), Some(handler)) = (
                 self.desktop_settings.borrow().as_ref(),
                 self.desktop_settings_handler.borrow_mut().take(),
@@ -247,12 +247,12 @@ glib::wrapper! {
 }
 
 impl SpotLyricApplication {
-    pub fn new(daemon_supervisor: DaemonSupervisor) -> Self {
+    pub fn new(backend_runtime: BackendRuntime) -> Self {
         let app: Self = glib::Object::builder()
             .property("application-id", config::APP_ID)
             .property("flags", gio::ApplicationFlags::FLAGS_NONE)
             .build();
-        app.imp().daemon_supervisor.replace(daemon_supervisor);
+        app.imp().backend_runtime.replace(backend_runtime);
         app
     }
 }
