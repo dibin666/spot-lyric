@@ -11,9 +11,8 @@ use serde_json::{json, Value};
 use sha1::{Digest as _, Sha1};
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message as WebSocketMessage,
-    MaybeTlsStream, WebSocketStream,
+    connect_async, tungstenite::protocol::Message as WebSocketMessage, MaybeTlsStream,
+    WebSocketStream,
 };
 
 use crate::{
@@ -29,13 +28,15 @@ use super::{
 
 const PLAYER_API_BASE: &str = "https://api.spotify.com/v1/me/player";
 const CURRENTLY_PLAYING_API: &str = "https://api.spotify.com/v1/me/player/currently-playing";
-const WEB_PLAYER_FALLBACK_INTERVAL: Duration = Duration::from_secs(10);
+const WEB_PLAYER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CACHED_PLAYING_EXTRAPOLATION: Duration = Duration::from_secs(3);
 const WEB_PLAYER_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 const CONNECT_STATE_ERROR_BACKOFF: Duration = Duration::from_secs(60);
 const DEALER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const SPOTIFY_WEB_CLIENT_VERSION: &str = "harmony:4.72.0-a9118221e";
 const TRACK_PLAYBACK_DEVICE_NAME: &str = "Spot-Lyric";
-const TRACK_PLAYBACK_PLATFORM_IDENTIFIER: &str = "web_player linux undefined;chrome 147.0.0.0;desktop";
+const TRACK_PLAYBACK_PLATFORM_IDENTIFIER: &str =
+    "web_player linux undefined;chrome 147.0.0.0;desktop";
 const TRACK_PLAYBACK_STATE_DEBUG_SOURCE: &str = "video_visibility_changed";
 
 type DealerWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -71,7 +72,6 @@ struct TrackPlaybackRegistrationResponse {
     initial_seq_num: u64,
 }
 
-
 impl Default for PlaybackFallbackState {
     fn default() -> Self {
         let now = Instant::now();
@@ -88,14 +88,15 @@ impl PlaybackFallbackState {
         let cached = self.last_web_player_snapshot.as_ref()?;
         let mut snapshot = cached.snapshot.clone();
         if snapshot.state.is_playing {
-            let elapsed_ms = now
-                .saturating_duration_since(cached.observed_at)
-                .as_millis()
-                .min(i64::MAX as u128) as i64;
+            let elapsed = now.saturating_duration_since(cached.observed_at);
+            let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
             snapshot.state.position_ms = snapshot.state.position_ms.saturating_add(elapsed_ms);
             if snapshot.state.duration_ms > 0 {
                 snapshot.state.position_ms =
                     snapshot.state.position_ms.min(snapshot.state.duration_ms);
+            }
+            if elapsed > MAX_CACHED_PLAYING_EXTRAPOLATION {
+                snapshot.state.is_playing = false;
             }
         }
         Some(snapshot)
@@ -208,14 +209,15 @@ impl ConnectStateClient {
     async fn connect_dealer(&self) -> Result<(DealerWebSocket, String)> {
         let dealer_url = self.resolve_dealer_url().await?;
         let access_token = self.transport.access_token().await?;
-        let mut url = Url::parse(&dealer_url)
-            .map_err(|error| DaemonError::InvalidArgument(format!("invalid dealer url: {error}")))?;
+        let mut url = Url::parse(&dealer_url).map_err(|error| {
+            DaemonError::InvalidArgument(format!("invalid dealer url: {error}"))
+        })?;
         url.query_pairs_mut()
             .append_pair("access_token", &access_token);
 
-        let (mut socket, _) = connect_async(url.as_str())
-            .await
-            .map_err(|error| DaemonError::InvalidResponse(format!("dealer websocket connect failed: {error}")))?;
+        let (mut socket, _) = connect_async(url.as_str()).await.map_err(|error| {
+            DaemonError::InvalidResponse(format!("dealer websocket connect failed: {error}"))
+        })?;
 
         let connection_id = timeout(DEALER_CONNECTION_TIMEOUT, async {
             loop {
@@ -296,11 +298,14 @@ impl ConnectStateClient {
             .as_str(),
         )?;
         let request = TransportRequest {
-            url: Url::parse(&url)
-                .map_err(|error| DaemonError::InvalidArgument(format!("invalid track state url: {error}")))?,
+            url: Url::parse(&url).map_err(|error| {
+                DaemonError::InvalidArgument(format!("invalid track state url: {error}"))
+            })?,
             method: Method::PUT,
             headers: Default::default(),
-            body: Some(TransportBody::Json(track_playback_state_body(state_seq_num))),
+            body: Some(TransportBody::Json(track_playback_state_body(
+                state_seq_num,
+            ))),
             response_type: ResponseType::Text,
             with_auth: true,
         };
@@ -314,7 +319,11 @@ impl ConnectStateClient {
         connection_id: &str,
     ) -> Result<Option<ConnectPlaybackSnapshot>> {
         let url = self.protocol.build_spclient_url(
-            format!("{}/{}", self.protocol.constants.connect_state_path, observer_device_id).as_str(),
+            format!(
+                "{}/{}",
+                self.protocol.constants.connect_state_path, observer_device_id
+            )
+            .as_str(),
         )?;
         let mut headers = HashMap::new();
         headers.insert(
@@ -529,11 +538,13 @@ fn connect_state_observer_body() -> Value {
 fn dealer_connection_id_from_message(message: WebSocketMessage) -> Result<Option<String>> {
     let text = match message {
         WebSocketMessage::Text(text) => Some(text.to_string()),
-        WebSocketMessage::Binary(bytes) => Some(
-            String::from_utf8(bytes.to_vec()).map_err(|error| {
-                DaemonError::InvalidResponse(format!("dealer websocket sent non-utf8 binary frame: {error}"))
-            })?,
-        ),
+        WebSocketMessage::Binary(bytes) => {
+            Some(String::from_utf8(bytes.to_vec()).map_err(|error| {
+                DaemonError::InvalidResponse(format!(
+                    "dealer websocket sent non-utf8 binary frame: {error}"
+                ))
+            })?)
+        }
         _ => None,
     };
 
@@ -566,7 +577,7 @@ pub(crate) fn map_connect_state_response(raw: &Value) -> Option<ConnectPlaybackS
     let track_raw = player
         .get("track")
         .or_else(|| player.pointer("/context_track"));
-    let track = track_raw.and_then(map_track);
+    let mut track = track_raw.and_then(map_track);
     let uri = track
         .as_ref()
         .and_then(|track| track.uri.clone())
@@ -576,13 +587,13 @@ pub(crate) fn map_connect_state_response(raw: &Value) -> Option<ConnectPlaybackS
         return None;
     }
 
-    let duration_ms = first_i64(player, &["duration", "duration_ms"])
+    let duration_ms = first_duration_ms(player, &["duration", "duration_ms"])
         .or_else(|| track.as_ref().map(|track| track.duration_ms))
         .unwrap_or_default()
         .max(0);
-    let position_ms = corrected_position_ms(player, duration_ms);
-    let is_playing = first_bool(player, &["is_playing"])
-        .unwrap_or_else(|| !first_bool(player, &["is_paused"]).unwrap_or(true));
+    fill_track_duration_from_player(&mut track, duration_ms);
+    let is_playing = player_is_playing(player);
+    let position_ms = corrected_position_ms(player, duration_ms, is_playing);
     let volume = extract_volume(raw).unwrap_or(1.0).clamp(0.0, 1.0);
 
     let state = PlaybackState {
@@ -627,7 +638,7 @@ pub(crate) fn map_connect_state_response(raw: &Value) -> Option<ConnectPlaybackS
 
 pub(crate) fn map_web_player_response(raw: &Value) -> Option<ConnectPlaybackSnapshot> {
     let item = raw.get("item").filter(|value| !value.is_null())?;
-    let track = map_track(item);
+    let mut track = map_track(item);
     let uri = track
         .as_ref()
         .and_then(|track| track.uri.clone())
@@ -640,13 +651,12 @@ pub(crate) fn map_web_player_response(raw: &Value) -> Option<ConnectPlaybackSnap
     let duration_ms = track
         .as_ref()
         .map(|track| track.duration_ms)
-        .or_else(|| first_i64(item, &["duration_ms", "duration"]))
+        .or_else(|| first_duration_ms(item, &["duration_ms", "duration"]))
         .unwrap_or_default()
         .max(0);
-    let position_ms = first_i64(raw, &["progress_ms", "position_ms", "position"])
-        .unwrap_or_default()
-        .clamp(0, duration_ms.max(i64::MAX / 2));
-    let is_playing = first_bool(raw, &["is_playing"]).unwrap_or(false);
+    fill_track_duration_from_player(&mut track, duration_ms);
+    let is_playing = player_is_playing(raw);
+    let position_ms = corrected_web_player_position_ms(raw, duration_ms, is_playing);
     let volume = raw
         .pointer("/device")
         .and_then(|device| first_f64(device, &["volume", "volume_percent"]))
@@ -737,9 +747,11 @@ fn map_track(raw: &Value) -> Option<TrackInfo> {
         album_uri: string_at(raw, &["album", "uri"])
             .or_else(|| string_at(raw, &["metadata", "album_uri"])),
         artists: extract_artists(raw),
-        duration_ms: first_i64(raw, &["duration_ms", "duration"])
+        duration_ms: first_duration_ms(raw, &["duration_ms", "duration"])
             .or_else(|| {
-                string_at(raw, &["metadata", "duration"]).and_then(|value| value.parse().ok())
+                string_at(raw, &["metadata", "duration"])
+                    .and_then(|value| value.parse().ok())
+                    .map(normalize_second_precision_duration_ms)
             })
             .unwrap_or_default(),
         explicit: first_bool(raw, &["explicit"]).unwrap_or_default(),
@@ -747,6 +759,17 @@ fn map_track(raw: &Value) -> Option<TrackInfo> {
         preview_url: None,
         images,
     })
+}
+
+fn fill_track_duration_from_player(track: &mut Option<TrackInfo>, duration_ms: i64) {
+    if duration_ms <= 0 {
+        return;
+    }
+    if let Some(track) = track.as_mut() {
+        if track.duration_ms <= 0 {
+            track.duration_ms = duration_ms;
+        }
+    }
 }
 
 fn extract_track_uri(raw: &Value) -> Option<String> {
@@ -828,19 +851,36 @@ fn extract_images(raw: &Value) -> Vec<ImageResource> {
     images
 }
 
-fn corrected_position_ms(player: &Value, duration_ms: i64) -> i64 {
+fn corrected_position_ms(player: &Value, duration_ms: i64, is_playing: bool) -> i64 {
     let base = first_i64(
         player,
         &["position_as_of_timestamp", "position", "position_ms"],
     )
     .unwrap_or_default();
-    let is_playing = first_bool(player, &["is_playing"])
-        .unwrap_or_else(|| !first_bool(player, &["is_paused"]).unwrap_or(true));
     let timestamp = first_i64(player, &["timestamp"]);
+    correct_position_for_timestamp(base, timestamp, duration_ms, is_playing)
+}
+
+fn corrected_web_player_position_ms(raw: &Value, duration_ms: i64, is_playing: bool) -> i64 {
+    let base = first_i64(raw, &["progress_ms", "position_ms", "position"]).unwrap_or_default();
+    let timestamp = first_i64(raw, &["timestamp"]);
+    correct_position_for_timestamp(base, timestamp, duration_ms, is_playing)
+}
+
+fn correct_position_for_timestamp(
+    base: i64,
+    timestamp: Option<i64>,
+    duration_ms: i64,
+    is_playing: bool,
+) -> i64 {
     let mut corrected = base;
     if is_playing {
         if let Some(timestamp) = timestamp {
-            corrected = corrected.saturating_add(chrono::Utc::now().timestamp_millis() - timestamp);
+            let elapsed_ms = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(timestamp)
+                .max(0);
+            corrected = corrected.saturating_add(elapsed_ms);
         }
     }
     if duration_ms > 0 {
@@ -848,6 +888,19 @@ fn corrected_position_ms(player: &Value, duration_ms: i64) -> i64 {
     } else {
         corrected.max(0)
     }
+}
+
+fn player_is_playing(player: &Value) -> bool {
+    if let Some(is_playing) = first_bool(player, &["is_playing", "playing"]) {
+        return is_playing;
+    }
+    if let Some(is_paused) = first_bool(player, &["is_paused", "paused"]) {
+        return !is_paused;
+    }
+    if let Some(speed) = first_f64(player, &["playback_speed"]) {
+        return speed > 0.0;
+    }
+    false
 }
 
 fn extract_volume(raw: &Value) -> Option<f64> {
@@ -875,9 +928,21 @@ fn first_string(raw: &Value, keys: &[&str]) -> Option<String> {
 }
 
 fn first_bool(raw: &Value, keys: &[&str]) -> Option<bool> {
-    keys.iter()
-        .find_map(|key| raw.get(*key))
-        .and_then(Value::as_bool)
+    keys.iter().find_map(|key| {
+        let value = raw.get(*key)?;
+        value
+            .as_bool()
+            .or_else(|| value.as_i64().map(|value| value != 0))
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => Some(true),
+                        "false" | "0" | "no" => Some(false),
+                        _ => None,
+                    })
+            })
+    })
 }
 
 fn first_i64(raw: &Value, keys: &[&str]) -> Option<i64> {
@@ -887,6 +952,29 @@ fn first_i64(raw: &Value, keys: &[&str]) -> Option<i64> {
             .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
             .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
     })
+}
+
+fn first_duration_ms(raw: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        let value = raw.get(*key)?;
+        let duration = value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))?;
+        Some(if key.ends_with("_ms") {
+            duration
+        } else {
+            normalize_second_precision_duration_ms(duration)
+        })
+    })
+}
+
+fn normalize_second_precision_duration_ms(duration: i64) -> i64 {
+    if duration > 0 && duration < 10_000 {
+        duration.saturating_mul(1_000)
+    } else {
+        duration
+    }
 }
 
 fn first_f64(raw: &Value, keys: &[&str]) -> Option<f64> {
@@ -953,6 +1041,7 @@ mod tests {
             snapshot.track.as_ref().unwrap().id,
             "0000000000000000000001"
         );
+        assert_eq!(snapshot.track.as_ref().unwrap().duration_ms, 180_000);
     }
 
     #[test]
@@ -1003,8 +1092,115 @@ mod tests {
     }
 
     #[test]
+    fn paused_connect_state_does_not_advance_from_old_timestamp() {
+        let raw = json!({
+            "player_state": {
+                "is_paused": true,
+                "timestamp": chrono::Utc::now().timestamp_millis() - 10_000,
+                "position_as_of_timestamp": 12_345,
+                "duration": 180_000,
+                "track": {
+                    "gid": "00000000000000000000000000000001",
+                    "metadata": {
+                        "title": "Paused Song",
+                        "artist_name": "Artist"
+                    }
+                }
+            }
+        });
+
+        let snapshot = map_connect_state_response(&raw).expect("snapshot");
+
+        assert!(!snapshot.state.is_playing);
+        assert_eq!(snapshot.state.position_ms, 12_345);
+    }
+
+    #[test]
+    fn web_player_position_uses_timestamp_when_playing() {
+        let raw = json!({
+            "timestamp": chrono::Utc::now().timestamp_millis() - 1_000,
+            "progress_ms": 42_000,
+            "is_playing": true,
+            "item": {
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Never Gonna Give You Up",
+                "duration_ms": 213_000,
+                "artists": [{ "name": "Rick Astley" }]
+            }
+        });
+
+        let snapshot = map_web_player_response(&raw).expect("snapshot");
+
+        assert!(snapshot.state.is_playing);
+        assert!(
+            (42_900..=43_300).contains(&snapshot.state.position_ms),
+            "timestamp-corrected position should include elapsed time, got {}",
+            snapshot.state.position_ms
+        );
+    }
+
+    #[test]
+    fn web_player_paused_position_ignores_old_timestamp() {
+        let raw = json!({
+            "timestamp": chrono::Utc::now().timestamp_millis() - 10_000,
+            "progress_ms": 42_000,
+            "is_playing": false,
+            "item": {
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Never Gonna Give You Up",
+                "duration_ms": 213_000,
+                "artists": [{ "name": "Rick Astley" }]
+            }
+        });
+
+        let snapshot = map_web_player_response(&raw).expect("snapshot");
+
+        assert!(!snapshot.state.is_playing);
+        assert_eq!(snapshot.state.position_ms, 42_000);
+    }
+
+    #[test]
+    fn stale_cached_playing_snapshot_is_frozen() {
+        let state = PlaybackFallbackState {
+            connect_state_next_allowed: Instant::now(),
+            web_player_next_allowed: Instant::now(),
+            last_web_player_snapshot: Some(CachedPlaybackSnapshot {
+                snapshot: ConnectPlaybackSnapshot {
+                    state: PlaybackState {
+                        is_playing: true,
+                        track_uri: "spotify:track:test".into(),
+                        track_name: "Test".into(),
+                        artist_name: String::new(),
+                        album_name: String::new(),
+                        album_art_url: String::new(),
+                        position_ms: 1_000,
+                        duration_ms: 120_000,
+                        volume: 1.0,
+                        player_status: "ready".into(),
+                    },
+                    track: None,
+                    active_device_id: None,
+                },
+                observed_at: Instant::now()
+                    - MAX_CACHED_PLAYING_EXTRAPOLATION
+                    - Duration::from_millis(100),
+            }),
+        };
+
+        let snapshot = state
+            .cached_web_player_snapshot(Instant::now())
+            .expect("snapshot");
+
+        assert!(!snapshot.state.is_playing);
+        assert!(snapshot.state.position_ms >= 4_000);
+    }
+
+    #[test]
     fn builds_spotify_web_observer_contract() {
-        let playback_device_id = playback_device_id_from_seed("7754b2fb-76ad-40ed-bca2-814f0d0f5617");
+        let playback_device_id =
+            playback_device_id_from_seed("7754b2fb-76ad-40ed-bca2-814f0d0f5617");
         assert_eq!(
             playback_device_id,
             "95153d0c1877b62b5e346a0da0d3b517811824a0"

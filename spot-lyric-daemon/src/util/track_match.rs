@@ -5,7 +5,7 @@ use crate::{
     util::spotify::{hex_to_base62, is_hex_track_id, resolve_track_identity, TrackIdentity},
 };
 
-const AUTO_MATCH_DURATION_TOLERANCE_MS: i64 = 3_000;
+const AUTO_MATCH_DURATION_TOLERANCE_MS: i64 = 1_000;
 const COMMENT_MATCH_DURATION_TOLERANCE_MS: i64 = 12_000;
 const MAX_AUTO_MATCH_QUERIES: usize = 6;
 const MAX_COMMENT_MATCH_QUERIES: usize = 10;
@@ -55,6 +55,52 @@ pub fn saved_match_track_context(track_uri: Option<&str>) -> (Option<&str>, Opti
 
 pub fn build_search_queries(track: &TrackInfo) -> Vec<String> {
     build_search_queries_with_limit(track, MAX_AUTO_MATCH_QUERIES, false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoMatchStrategy {
+    TitleDuration,
+    TitleArtistDuration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoMatchQueryGroup {
+    pub strategy: AutoMatchStrategy,
+    pub queries: Vec<String>,
+}
+
+pub fn build_auto_match_query_groups(track: &TrackInfo) -> Vec<AutoMatchQueryGroup> {
+    let title_variants = title_search_variants(track.name.as_str(), false);
+    if title_variants.is_empty() {
+        return Vec::new();
+    }
+
+    let mut title_queries = Vec::new();
+    for title in &title_variants {
+        push_query_variant(&mut title_queries, title);
+    }
+
+    let mut title_artist_queries = Vec::new();
+    let artist_queries = auto_match_artist_queries(track);
+    for title in &title_variants {
+        for artist in &artist_queries {
+            push_query_variant(
+                &mut title_artist_queries,
+                format!("{title} {artist}").as_str(),
+            );
+        }
+    }
+
+    vec![
+        AutoMatchQueryGroup {
+            strategy: AutoMatchStrategy::TitleDuration,
+            queries: title_queries,
+        },
+        AutoMatchQueryGroup {
+            strategy: AutoMatchStrategy::TitleArtistDuration,
+            queries: title_artist_queries,
+        },
+    ]
 }
 
 pub fn build_comment_search_queries(track: &TrackInfo) -> Vec<String> {
@@ -141,6 +187,24 @@ pub fn rank_candidates_for_track(
     )
 }
 
+pub fn rank_auto_match_candidates_for_track(
+    track: &TrackInfo,
+    candidates: Vec<StoredLyricsCandidate>,
+    preferred_provider: Option<&str>,
+    strategy: AutoMatchStrategy,
+) -> Vec<StoredLyricsCandidate> {
+    let mut ranked: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            strict_auto_match_rank(track, &candidate, preferred_provider, strategy)
+                .map(|rank| (rank, candidate))
+        })
+        .collect();
+
+    ranked.sort_by(|left, right| left.0.cmp(&right.0));
+    ranked.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
 pub fn rank_comment_candidates_for_track(
     track: &TrackInfo,
     candidates: Vec<StoredLyricsCandidate>,
@@ -198,6 +262,187 @@ fn rank_candidates_for_track_with_options(
 struct TrackMatchOptions {
     duration_tolerance_ms: i64,
     filter_duration_mismatch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StrictAutoMatchRank {
+    preferred_provider_rank: u8,
+    duration_delta_ms: i64,
+    provider_score_rank: i64,
+    title: String,
+    id: String,
+}
+
+impl Eq for StrictAutoMatchRank {}
+
+impl Ord for StrictAutoMatchRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.preferred_provider_rank
+            .cmp(&other.preferred_provider_rank)
+            .then_with(|| self.duration_delta_ms.cmp(&other.duration_delta_ms))
+            .then_with(|| self.provider_score_rank.cmp(&other.provider_score_rank))
+            .then_with(|| self.title.cmp(&other.title))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for StrictAutoMatchRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn strict_auto_match_rank(
+    track: &TrackInfo,
+    candidate: &StoredLyricsCandidate,
+    preferred_provider: Option<&str>,
+    strategy: AutoMatchStrategy,
+) -> Option<StrictAutoMatchRank> {
+    let duration_ms = candidate.duration_ms?;
+    let duration_delta_ms = strict_duration_delta(track.duration_ms, duration_ms)?;
+    if !title_matches_track(track.name.as_str(), candidate.title.as_str()) {
+        return None;
+    }
+    if strategy == AutoMatchStrategy::TitleArtistDuration
+        && !artist_matches_track(track, candidate.artists.as_slice())
+    {
+        return None;
+    }
+
+    Some(StrictAutoMatchRank {
+        preferred_provider_rank: if preferred_provider
+            .is_some_and(|provider| candidate.provider.as_str() == provider)
+        {
+            0
+        } else {
+            1
+        },
+        duration_delta_ms,
+        provider_score_rank: provider_score_rank(candidate.score),
+        title: candidate.title.clone(),
+        id: candidate.id.clone(),
+    })
+}
+
+fn strict_duration_delta(expected: i64, actual: i64) -> Option<i64> {
+    if expected <= 0 || actual <= 0 {
+        return None;
+    }
+    let delta = candidate_duration_delta_ms(expected, actual)?;
+    if delta <= AUTO_MATCH_DURATION_TOLERANCE_MS {
+        Some(delta)
+    } else {
+        None
+    }
+}
+
+fn candidate_duration_delta_ms(expected_ms: i64, actual: i64) -> Option<i64> {
+    if actual <= 0 {
+        return None;
+    }
+
+    if expected_ms >= 30_000 && actual < 10_000 {
+        duration_delta_to_second_precision_interval(expected_ms, actual)
+    } else if actual % 1_000 == 0 {
+        duration_delta_to_second_precision_interval(expected_ms, actual / 1_000)
+    } else {
+        Some((expected_ms - actual).abs())
+    }
+}
+
+fn duration_delta_to_second_precision_interval(
+    expected_ms: i64,
+    actual_seconds: i64,
+) -> Option<i64> {
+    let start = actual_seconds.checked_mul(1_000)?;
+    let end = start.checked_add(999)?;
+    if expected_ms < start {
+        Some(start - expected_ms)
+    } else if expected_ms > end {
+        Some(expected_ms - end)
+    } else {
+        Some(0)
+    }
+}
+
+fn provider_score_rank(score: Option<f64>) -> i64 {
+    score
+        .filter(|score| score.is_finite())
+        .map(|score| (score * -1_000_000.0).round() as i64)
+        .unwrap_or(i64::MAX)
+}
+
+fn title_matches_track(expected: &str, actual: &str) -> bool {
+    let expected_variants = normalized_title_match_variants(expected);
+    let actual_variants = normalized_title_match_variants(actual);
+    expected_variants
+        .iter()
+        .any(|expected| actual_variants.iter().any(|actual| actual == expected))
+}
+
+fn artist_matches_track(track: &TrackInfo, actual_artists: &[String]) -> bool {
+    let expected: std::collections::HashSet<_> = track
+        .artists
+        .iter()
+        .flat_map(|artist| normalized_artist_match_variants(artist.name.as_str()))
+        .collect();
+    if expected.is_empty() {
+        return false;
+    }
+
+    actual_artists
+        .iter()
+        .flat_map(|artist| normalized_artist_match_variants(artist.as_str()))
+        .any(|artist| expected.contains(&artist))
+}
+
+fn normalized_title_match_variants(title: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    for variant in title_search_variants(title, true) {
+        push_normalized_match_variant(&mut variants, variant.as_str());
+    }
+    variants
+}
+
+fn normalized_artist_match_variants(artist: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    push_normalized_match_variant(&mut variants, artist);
+    let lower = artist.to_lowercase();
+    for separator in [
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        " featuring ",
+        " with ",
+        " x ",
+        " & ",
+        " and ",
+        ",",
+        "，",
+        "、",
+        "/",
+        "／",
+        ";",
+        "；",
+        "|",
+    ] {
+        for part in lower.split(separator) {
+            push_normalized_match_variant(&mut variants, part);
+        }
+    }
+    variants
+}
+
+fn push_normalized_match_variant(variants: &mut Vec<String>, value: &str) {
+    let normalized = normalize_match_text(value);
+    if !normalized.is_empty() && !variants.contains(&normalized) {
+        variants.push(normalized);
+    }
+}
+
+fn normalize_match_text(value: &str) -> String {
+    normalize_search_request_query(value).to_lowercase()
 }
 
 fn is_duration_match_within_tolerance(expected: i64, actual: i64, tolerance_ms: i64) -> bool {
@@ -314,7 +559,7 @@ fn title_search_variants(title: &str, include_original_version_variant: bool) ->
         push_query_variant(&mut variants, featured_stripped.as_str());
     }
 
-    if let Some(alias) = split_dual_title(version_stripped.as_str()) {
+    for alias in split_dual_title_aliases(version_stripped.as_str()) {
         push_query_variant(&mut variants, alias.as_str());
     }
 
@@ -374,22 +619,20 @@ fn looks_like_version_suffix(value: &str) -> bool {
         .any(|hint| normalized.contains(hint))
 }
 
-fn split_dual_title(title: &str) -> Option<String> {
-    for separator in [" / ", " | ", " · ", "：", ": "] {
+fn split_dual_title_aliases(title: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for separator in [" / ", " | ", " · ", "：", ": ", " - ", " – ", " — ", " ~ "] {
         if let Some((left, right)) = title.split_once(separator) {
             let left = normalize_search_request_query(left);
             let right = normalize_search_request_query(right);
-            if !left.is_empty() && !right.is_empty() && left != right {
-                let candidate = if right.chars().any(|character| !character.is_ascii()) {
-                    right
-                } else {
-                    left
-                };
-                return Some(candidate);
+            if left.is_empty() || right.is_empty() || left == right {
+                continue;
             }
+            push_query_variant(&mut aliases, left.as_str());
+            push_query_variant(&mut aliases, right.as_str());
         }
     }
-    None
+    aliases
 }
 
 fn push_query_variant(variants: &mut Vec<String>, value: &str) {
@@ -397,6 +640,23 @@ fn push_query_variant(variants: &mut Vec<String>, value: &str) {
     if !normalized.is_empty() && !variants.contains(&normalized) {
         variants.push(normalized);
     }
+}
+
+fn auto_match_artist_queries(track: &TrackInfo) -> Vec<String> {
+    let mut artists = Vec::new();
+    if let Some(primary) = track.artists.first() {
+        push_query_variant(&mut artists, primary.name.as_str());
+    }
+
+    let all_artists = track
+        .artists
+        .iter()
+        .map(|artist| artist.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    push_query_variant(&mut artists, all_artists.as_str());
+
+    artists
 }
 
 fn normalize_search_request_query(value: &str) -> String {
@@ -482,6 +742,20 @@ mod tests {
     }
 
     #[test]
+    fn build_auto_match_query_groups_uses_title_then_title_artist() {
+        let groups = build_auto_match_query_groups(&sample_track());
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].strategy, AutoMatchStrategy::TitleDuration);
+        assert_eq!(groups[0].queries, vec!["Counting Stars".to_string()]);
+        assert_eq!(groups[1].strategy, AutoMatchStrategy::TitleArtistDuration);
+        assert_eq!(
+            groups[1].queries,
+            vec!["Counting Stars OneRepublic".to_string()]
+        );
+    }
+
+    #[test]
     fn build_comment_search_queries_keeps_more_fallback_variants() {
         let mut track = sample_track();
         track.name = "神っぽいな / God-ish (English ver.)".into();
@@ -521,6 +795,180 @@ mod tests {
             Some("qq"),
         );
         assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn rank_auto_match_candidates_keeps_exact_title_with_one_second_duration_tolerance() {
+        let track = sample_track();
+        let ranked = rank_auto_match_candidates_for_track(
+            &track,
+            vec![
+                StoredLyricsCandidate {
+                    album: "Native".into(),
+                    artists: vec!["Different Artist".into()],
+                    duration_ms: Some(track.duration_ms + 1_000),
+                    id: "kept".into(),
+                    mid: None,
+                    provider: "netease".into(),
+                    score: None,
+                    title: "Counting Stars".into(),
+                },
+                StoredLyricsCandidate {
+                    album: "Native".into(),
+                    artists: vec!["OneRepublic".into()],
+                    duration_ms: Some(track.duration_ms + 1_001),
+                    id: "rejected-duration".into(),
+                    mid: None,
+                    provider: "netease".into(),
+                    score: None,
+                    title: "Counting Stars".into(),
+                },
+                StoredLyricsCandidate {
+                    album: "Native".into(),
+                    artists: vec!["OneRepublic".into()],
+                    duration_ms: Some(track.duration_ms),
+                    id: "rejected-title".into(),
+                    mid: None,
+                    provider: "netease".into(),
+                    score: None,
+                    title: "Counting Stars Live".into(),
+                },
+            ],
+            Some("netease"),
+            AutoMatchStrategy::TitleDuration,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, "kept");
+    }
+
+    #[test]
+    fn rank_auto_match_title_artist_strategy_requires_exact_artist() {
+        let track = sample_track();
+        let ranked = rank_auto_match_candidates_for_track(
+            &track,
+            vec![
+                StoredLyricsCandidate {
+                    album: "Native".into(),
+                    artists: vec!["Different Artist".into()],
+                    duration_ms: Some(track.duration_ms),
+                    id: "rejected-artist".into(),
+                    mid: None,
+                    provider: "netease".into(),
+                    score: None,
+                    title: "Counting Stars".into(),
+                },
+                StoredLyricsCandidate {
+                    album: "Native".into(),
+                    artists: vec!["OneRepublic".into()],
+                    duration_ms: Some(track.duration_ms),
+                    id: "kept".into(),
+                    mid: None,
+                    provider: "qq".into(),
+                    score: None,
+                    title: "Counting Stars".into(),
+                },
+            ],
+            Some("qq"),
+            AutoMatchStrategy::TitleArtistDuration,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, "kept");
+    }
+
+    #[test]
+    fn rank_auto_match_accepts_exact_dual_title_alias() {
+        let mut track = sample_track();
+        track.name = "God-ish".into();
+        track.artists[0].name = "PinocchioP".into();
+
+        let ranked = rank_auto_match_candidates_for_track(
+            &track,
+            vec![StoredLyricsCandidate {
+                album: String::new(),
+                artists: vec!["PinocchioP".into()],
+                duration_ms: Some(track.duration_ms),
+                id: "dual-title".into(),
+                mid: None,
+                provider: "netease".into(),
+                score: None,
+                title: "神っぽいな / God-ish".into(),
+            }],
+            Some("netease"),
+            AutoMatchStrategy::TitleArtistDuration,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, "dual-title");
+    }
+
+    #[test]
+    fn rank_auto_match_rejects_unknown_durations() {
+        let ranked = rank_auto_match_candidates_for_track(
+            &sample_track(),
+            vec![StoredLyricsCandidate {
+                album: "Native".into(),
+                artists: vec!["OneRepublic".into()],
+                duration_ms: None,
+                id: "unknown-duration".into(),
+                mid: None,
+                provider: "netease".into(),
+                score: None,
+                title: "Counting Stars".into(),
+            }],
+            Some("netease"),
+            AutoMatchStrategy::TitleDuration,
+        );
+
+        assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn rank_auto_match_accepts_provider_duration_reported_in_seconds() {
+        let track = sample_track();
+        let ranked = rank_auto_match_candidates_for_track(
+            &track,
+            vec![StoredLyricsCandidate {
+                album: "Native".into(),
+                artists: vec!["OneRepublic".into()],
+                duration_ms: Some(257),
+                id: "seconds-duration".into(),
+                mid: None,
+                provider: "netease".into(),
+                score: None,
+                title: "Counting Stars".into(),
+            }],
+            Some("netease"),
+            AutoMatchStrategy::TitleArtistDuration,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, "seconds-duration");
+    }
+
+    #[test]
+    fn rank_auto_match_accepts_second_precision_duration_floor() {
+        let mut track = sample_track();
+        track.duration_ms = 257_999;
+        let ranked = rank_auto_match_candidates_for_track(
+            &track,
+            vec![StoredLyricsCandidate {
+                album: "Native".into(),
+                artists: vec!["OneRepublic".into()],
+                duration_ms: Some(256_000),
+                id: "second-floor-duration".into(),
+                mid: None,
+                provider: "qq".into(),
+                score: None,
+                title: "Counting Stars".into(),
+            }],
+            Some("qq"),
+            AutoMatchStrategy::TitleArtistDuration,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, "second-floor-duration");
     }
 
     #[test]

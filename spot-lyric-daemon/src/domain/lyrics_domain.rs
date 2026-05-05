@@ -16,8 +16,8 @@ use crate::{
     util::{
         convert::{decode_candidate_id, to_public_lyrics_candidate, LyricsProviderPreference},
         track_match::{
-            build_search_queries, dedupe_candidates, rank_candidates_for_track,
-            saved_match_track_context,
+            build_auto_match_query_groups, dedupe_candidates, rank_auto_match_candidates_for_track,
+            saved_match_track_context, AutoMatchQueryGroup, AutoMatchStrategy,
         },
     },
 };
@@ -81,11 +81,11 @@ impl LyricsDomain {
             }
 
             return self
-                .spotify_or_empty(Some(track_uri), Some(track.id.as_str()))
+                .spotify_or_unmatched(Some(track_uri), Some(track.id.as_str()))
                 .await;
         }
 
-        self.spotify_or_empty(Some(track_uri), fallback_track_id.as_deref())
+        self.spotify_or_unmatched(Some(track_uri), fallback_track_id.as_deref())
             .await
     }
 
@@ -221,38 +221,83 @@ impl LyricsDomain {
         track: &TrackInfo,
         preferred_provider: &str,
     ) -> Result<Vec<StoredLyricsCandidate>> {
-        let queries = build_search_queries(track);
-        if queries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let (netease, qq) = tokio::try_join!(
-            search_provider_all_queries(&self.netease, &queries),
-            search_provider_all_queries(&self.qq, &queries),
-        )?;
-        let all = dedupe_candidates(netease.into_iter().chain(qq).collect());
         let preferred = if preferred_provider == "qq" {
             "qq"
         } else {
             "netease"
         };
 
-        Ok(rank_candidates_for_track(track, all, Some(preferred)))
+        let groups = build_auto_match_query_groups(track);
+        let title_duration_group = groups
+            .iter()
+            .find(|group| group.strategy == AutoMatchStrategy::TitleDuration)
+            .cloned();
+        let title_artist_duration_group = groups
+            .iter()
+            .find(|group| group.strategy == AutoMatchStrategy::TitleArtistDuration)
+            .cloned();
+
+        let (title_duration, title_artist_duration) = tokio::try_join!(
+            self.search_candidates_for_group(track, title_duration_group.as_ref(), preferred),
+            self.search_candidates_for_group(
+                track,
+                title_artist_duration_group.as_ref(),
+                preferred
+            ),
+        )?;
+
+        Ok(dedupe_candidates(
+            title_duration
+                .into_iter()
+                .chain(title_artist_duration)
+                .collect(),
+        ))
     }
 
-    async fn spotify_or_empty(
+    async fn search_candidates_for_group(
+        &self,
+        track: &TrackInfo,
+        group: Option<&AutoMatchQueryGroup>,
+        preferred_provider: &str,
+    ) -> Result<Vec<StoredLyricsCandidate>> {
+        let Some(group) = group.filter(|group| !group.queries.is_empty()) else {
+            return Ok(Vec::new());
+        };
+
+        let (netease, qq) = tokio::try_join!(
+            search_provider_all_queries(&self.netease, &group.queries),
+            search_provider_all_queries(&self.qq, &group.queries),
+        )?;
+        let all = dedupe_candidates(netease.into_iter().chain(qq).collect());
+
+        Ok(rank_auto_match_candidates_for_track(
+            track,
+            all,
+            Some(preferred_provider),
+            group.strategy,
+        ))
+    }
+
+    async fn spotify_or_unmatched(
         &self,
         track_uri: Option<&str>,
         track_id: Option<&str>,
     ) -> Result<LyricsPayload> {
         let Some(track_id) = track_id.filter(|track_id| !track_id.trim().is_empty()) else {
-            return Ok(empty_lyrics_payload(track_uri, None, "spotify"));
+            return Ok(unmatched_lyrics_payload(track_uri, None));
         };
 
         match self.spotify_lyrics.get_color_lyrics(track_id).await {
-            Ok(raw) => Ok(map_spotify_lyrics_payload(track_uri, Some(track_id), &raw)),
+            Ok(raw) => {
+                let payload = map_spotify_lyrics_payload(track_uri, Some(track_id), &raw);
+                if has_usable_lyrics(&payload) {
+                    Ok(payload)
+                } else {
+                    Ok(unmatched_lyrics_payload(track_uri, Some(track_id)))
+                }
+            }
             Err(DaemonError::HttpStatus { status: 404, .. }) => {
-                Ok(empty_lyrics_payload(track_uri, Some(track_id), "spotify"))
+                Ok(unmatched_lyrics_payload(track_uri, Some(track_id)))
             }
             Err(error) => Err(error),
         }
@@ -272,6 +317,24 @@ fn empty_lyrics_payload(
         source: source.into(),
         sync_type: "unsynced".into(),
         lines: Vec::new(),
+    }
+}
+
+fn unmatched_lyrics_payload(track_uri: Option<&str>, track_id: Option<&str>) -> LyricsPayload {
+    LyricsPayload {
+        track_uri: track_uri.map(str::to_owned),
+        track_id: track_id.map(str::to_owned),
+        language: None,
+        provider: None,
+        source: "unmatched".into(),
+        sync_type: "line".into(),
+        lines: vec![LyricsLine {
+            text: "未匹配".into(),
+            translated_text: None,
+            start_time_ms: 0,
+            end_time_ms: 0,
+            words: Vec::new(),
+        }],
     }
 }
 
@@ -447,5 +510,42 @@ mod tests {
             parse_qq_link("https://y.qq.com/n/ryqq/songDetail/003OUlho2HcRHC"),
             Some(("003OUlho2HcRHC".into(), Some("003OUlho2HcRHC".into())))
         );
+    }
+
+    #[test]
+    fn unmatched_payload_displays_fixed_text() {
+        let payload = unmatched_lyrics_payload(Some("spotify:track:abc"), Some("abc"));
+
+        assert_eq!(payload.source, "unmatched");
+        assert_eq!(payload.sync_type, "line");
+        assert_eq!(payload.lines.len(), 1);
+        assert_eq!(payload.lines[0].text, "未匹配");
+        assert_eq!(payload.lines[0].start_time_ms, 0);
+    }
+
+    #[test]
+    fn spotify_color_lyrics_payload_is_usable_as_exact_fallback() {
+        let raw = serde_json::json!({
+            "lyrics": {
+                "language": "zh",
+                "provider": "Spotify",
+                "syncType": "LINE_SYNCED",
+                "lines": [
+                    {
+                        "startTimeMs": "1234",
+                        "endTimeMs": "2345",
+                        "words": "第一句"
+                    }
+                ]
+            }
+        });
+
+        let payload = map_spotify_lyrics_payload(Some("spotify:track:abc"), Some("abc"), &raw);
+
+        assert_eq!(payload.source, "spotify");
+        assert_eq!(payload.sync_type, "line");
+        assert_eq!(payload.track_id.as_deref(), Some("abc"));
+        assert_eq!(payload.lines[0].text, "第一句");
+        assert_eq!(payload.lines[0].start_time_ms, 1234);
     }
 }

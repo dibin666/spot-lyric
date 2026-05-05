@@ -5,7 +5,7 @@ use crate::error::{DaemonError, Result};
 pub const APP_NAME: &str = "spot-lyric";
 pub const DBUS_BUS_NAME: &str = "cn.spotlyric.Daemon";
 pub const DBUS_OBJECT_PATH: &str = "/cn/spotlyric/Daemon";
-pub const POLL_INTERVAL_MS: u64 = 2_000;
+pub const POLL_INTERVAL_MS: u64 = 500;
 pub const SQLITE_FILE: &str = "spot-lyric.db";
 
 #[derive(Debug, Clone)]

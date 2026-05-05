@@ -716,43 +716,23 @@ impl PreferencesWindow {
         let imp = self.imp();
         *imp.last_auth.borrow_mut() = Some(snapshot.clone());
 
-        let (status_class, title, subtitle) = match snapshot.status.as_str() {
-            "ready" => (
-                "ready",
-                "已登录".to_string(),
-                snapshot
-                    .active_profile_id
-                    .clone()
-                    .or_else(|| snapshot.client_id.clone())
-                    .unwrap_or_else(|| "Spotify Web".into()),
-            ),
-            "refreshing" => ("refreshing", "正在刷新…".to_string(), "请稍候".to_string()),
-            "error" => (
-                "error",
-                "登录已过期".to_string(),
-                snapshot.error.clone().unwrap_or_else(|| "未知错误".into()),
-            ),
-            _ => (
-                "idle",
-                "未登录".to_string(),
-                "点击右侧按钮导入 Cookie".to_string(),
-            ),
-        };
+        let view = auth_status_view(snapshot);
 
         if let Some(row) = imp.account_status_row.borrow().as_ref() {
-            row.set_title(&title);
-            row.set_subtitle(&subtitle);
+            row.set_title(&view.title);
+            row.set_subtitle(&view.subtitle);
         }
         if let Some(dot) = imp.account_status_dot.borrow().as_ref() {
             for c in ["idle", "refreshing", "ready", "error"] {
                 dot.remove_css_class(c);
             }
-            dot.add_css_class(status_class);
+            dot.add_css_class(view.status_class);
         }
 
-        match snapshot.status.as_str() {
-            "error" => self.show_banner("登录已过期，请重新导入 Cookie", Some("重新导入")),
-            _ => self.hide_banner(),
+        if let Some(banner) = view.banner {
+            self.show_banner(banner.message, banner.button_label);
+        } else {
+            self.hide_banner();
         }
     }
 
@@ -890,6 +870,76 @@ fn combo_index(combo: &adw::ComboRow, len: usize) -> usize {
     } else {
         0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthStatusView {
+    status_class: &'static str,
+    title: String,
+    subtitle: String,
+    banner: Option<AuthStatusBanner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthStatusBanner {
+    message: &'static str,
+    button_label: Option<&'static str>,
+}
+
+fn auth_status_view(snapshot: &AuthSnapshot) -> AuthStatusView {
+    match snapshot.status.as_str() {
+        "ready" => ready_auth_status_view(snapshot),
+        "refreshing" if auth_snapshot_has_account_identity(snapshot) => {
+            ready_auth_status_view(snapshot)
+        }
+        "refreshing" => AuthStatusView {
+            status_class: "refreshing",
+            title: "正在刷新…".into(),
+            subtitle: "请稍候".into(),
+            banner: None,
+        },
+        "error" => AuthStatusView {
+            status_class: "error",
+            title: "登录已过期".into(),
+            subtitle: snapshot.error.clone().unwrap_or_else(|| "未知错误".into()),
+            banner: Some(AuthStatusBanner {
+                message: "登录已过期，请重新导入 Cookie",
+                button_label: Some("重新导入"),
+            }),
+        },
+        _ => AuthStatusView {
+            status_class: "idle",
+            title: "未登录".into(),
+            subtitle: "点击右侧按钮导入 Cookie".into(),
+            banner: None,
+        },
+    }
+}
+
+fn ready_auth_status_view(snapshot: &AuthSnapshot) -> AuthStatusView {
+    AuthStatusView {
+        status_class: "ready",
+        title: "已登录".into(),
+        subtitle: snapshot
+            .active_profile_id
+            .clone()
+            .or_else(|| snapshot.client_id.clone())
+            .unwrap_or_else(|| "Spotify Web".into()),
+        banner: None,
+    }
+}
+
+fn auth_snapshot_has_account_identity(snapshot: &AuthSnapshot) -> bool {
+    snapshot
+        .active_profile_id
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || snapshot
+            .client_id
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
 }
 
 // ─── helper: bridge UI updates from std::mpsc into preference window calls ──
@@ -1049,6 +1099,24 @@ mod tests {
         assert!(manual_match_available("spotify:track:abc"));
         assert!(!manual_match_available(""));
         assert!(!manual_match_available("   "));
+    }
+
+    #[test]
+    fn auth_refreshing_snapshot_with_existing_account_keeps_ready_display() {
+        let snapshot = AuthSnapshot {
+            status: "refreshing".into(),
+            active_profile_id: Some("dibin".into()),
+            client_id: Some("client-id".into()),
+            has_cookie: true,
+            ..AuthSnapshot::default()
+        };
+
+        let view = auth_status_view(&snapshot);
+
+        assert_eq!(view.status_class, "ready");
+        assert_eq!(view.title, "已登录");
+        assert_eq!(view.subtitle, "dibin");
+        assert_eq!(view.banner, None);
     }
 
     #[test]

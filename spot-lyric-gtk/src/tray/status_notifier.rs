@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 const APP_ICON_RELATIVE_PATH: &str = "scalable/apps/cn.spotlyric.Gtk.svg";
 const TRAY_ICON_THEME_ENV: &str = "SPOT_LYRIC_ICON_THEME_PATH";
+const ICON_REFRESH_DELAYS_MS: [u64; 3] = [300, 1_200, 3_000];
 
 #[derive(Default, Clone)]
 pub struct TrayState {
@@ -39,6 +40,15 @@ fn local_icon_theme_path() -> String {
         }
     }
 
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = manifest_dir.join("target");
+    let running_from_target = std::env::current_exe()
+        .map(|exe| exe.starts_with(&target_dir))
+        .unwrap_or(false);
+    if !running_from_target {
+        return String::new();
+    }
+
     let source_icon_theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons");
     if source_icon_theme.join(APP_ICON_RELATIVE_PATH).is_file() {
         return source_icon_theme.to_string_lossy().into_owned();
@@ -47,13 +57,18 @@ fn local_icon_theme_path() -> String {
     String::new()
 }
 
-fn tray_icon_pixmaps() -> Vec<Icon> {
-    vec![draw_tray_icon(64), draw_tray_icon(32), draw_tray_icon(22)]
+fn tray_icon_pixmaps(generation: u8) -> Vec<Icon> {
+    vec![
+        draw_tray_icon(64, generation),
+        draw_tray_icon(32, generation),
+        draw_tray_icon(22, generation),
+    ]
 }
 
-fn draw_tray_icon(size: i32) -> Icon {
+fn draw_tray_icon(size: i32, generation: u8) -> Icon {
     let side = size.max(1) as usize;
     let mut data = vec![0; side * side * 4];
+    data[1] = generation;
 
     for y in 0..size {
         for x in 0..size {
@@ -244,7 +259,7 @@ pub struct TrayHandle {
 
 impl TrayHandle {
     pub fn refresh(&self) {
-        self.handle.update(|_| {});
+        self.handle.update(|tray| tray.bump_icon_generation());
     }
 }
 
@@ -252,6 +267,7 @@ pub struct StatusNotifierTray {
     cmd_tx: mpsc::UnboundedSender<Command>,
     state: Arc<Mutex<TrayState>>,
     action_tx: mpsc::UnboundedSender<TrayAction>,
+    icon_generation: u8,
 }
 
 impl StatusNotifierTray {
@@ -265,6 +281,7 @@ impl StatusNotifierTray {
             cmd_tx,
             state,
             action_tx,
+            icon_generation: 0,
         };
 
         let svc = ksni::TrayService::new(tray);
@@ -276,6 +293,18 @@ impl StatusNotifierTray {
         std::thread::spawn(move || {
             svc.spawn();
         });
+
+        let icon_refresh_handle = handle.clone();
+        std::thread::spawn(move || {
+            for delay_ms in ICON_REFRESH_DELAYS_MS {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                icon_refresh_handle.update(|tray| tray.bump_icon_generation());
+            }
+        });
+    }
+
+    fn bump_icon_generation(&mut self) {
+        self.icon_generation = self.icon_generation.wrapping_add(1);
     }
 }
 
@@ -301,7 +330,7 @@ impl Tray for StatusNotifierTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        tray_icon_pixmaps()
+        tray_icon_pixmaps(self.icon_generation)
     }
 
     fn title(&self) -> String {
@@ -326,7 +355,7 @@ impl Tray for StatusNotifierTray {
             icon_name: config::APP_ID.to_string(),
             title: "Spot-Lyric".to_string(),
             description: desc,
-            icon_pixmap: tray_icon_pixmaps(),
+            icon_pixmap: tray_icon_pixmaps(self.icon_generation),
         }
     }
 
@@ -466,7 +495,7 @@ mod tests {
 
     #[test]
     fn tray_icon_pixmaps_are_valid_argb_buffers() {
-        let pixmaps = tray_icon_pixmaps();
+        let pixmaps = tray_icon_pixmaps(0);
 
         assert!(!pixmaps.is_empty());
         for icon in pixmaps {
@@ -483,5 +512,15 @@ mod tests {
 
         assert!(!path.is_empty());
         assert!(Path::new(&path).exists());
+    }
+
+    #[test]
+    fn tray_icon_generation_changes_invisible_pixel_for_new_icon_signal() {
+        let first = tray_icon_pixmaps(1);
+        let second = tray_icon_pixmaps(2);
+
+        assert_eq!(first[0].data[0], 0);
+        assert_eq!(second[0].data[0], 0);
+        assert_ne!(first[0].data, second[0].data);
     }
 }
