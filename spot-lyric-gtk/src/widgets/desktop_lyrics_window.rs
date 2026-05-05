@@ -16,7 +16,7 @@ use gtk::{gio, glib};
 use crate::config;
 use crate::dbus::types::{LyricsLine, LyricsPayload, PlaybackState};
 use crate::platform::{MonitorGeometry, X11Helper};
-use crate::utils::{hex_to_rgb, position_clock::CellClock};
+use crate::utils::{font_css_from_description, hex_to_rgb, position_clock::CellClock};
 
 const APP_INSTANCE: &str = "spot-lyric-gtk";
 
@@ -159,15 +159,18 @@ impl DesktopLyricsWindow {
         let settings = gio::Settings::new(config::APP_ID);
         let width = settings.int("desktop-lyrics-width").max(320);
         self.set_default_size(width, -1);
+        self.set_size_request(width, -1);
         *self.imp().settings.borrow_mut() = Some(settings);
     }
 
     fn build_ui(&self) {
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .halign(gtk::Align::Center)
+            .halign(gtk::Align::Fill)
             .valign(gtk::Align::Center)
+            .hexpand(true)
             .css_classes(["desktop-lyrics-container"])
+            .tooltip_text("关闭锁定后，按住歌词区域拖动")
             .build();
 
         let active_label = gtk::Label::builder()
@@ -176,7 +179,8 @@ impl DesktopLyricsWindow {
             .wrap(true)
             .wrap_mode(pango::WrapMode::WordChar)
             .justify(gtk::Justification::Center)
-            .halign(gtk::Align::Center)
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
             .build();
 
         let next_label = gtk::Label::builder()
@@ -185,13 +189,20 @@ impl DesktopLyricsWindow {
             .wrap(true)
             .wrap_mode(pango::WrapMode::WordChar)
             .justify(gtk::Justification::Center)
-            .halign(gtk::Align::Center)
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
             .build();
 
         let drag_handle = gtk::Box::builder()
             .css_classes(["drag-handle"])
             .halign(gtk::Align::Center)
+            .tooltip_text("关闭锁定后，按住这里拖动")
             .build();
+        let drag_hint = gtk::Label::builder()
+            .label("拖动")
+            .css_classes(["drag-handle-label"])
+            .build();
+        drag_handle.append(&drag_hint);
 
         container.append(&active_label);
         container.append(&next_label);
@@ -253,7 +264,13 @@ impl DesktopLyricsWindow {
                     if let Some(s) = win.imp().settings.borrow().as_ref() {
                         let w = s.int("desktop-lyrics-width").max(320);
                         win.set_default_size(w, -1);
+                        win.set_size_request(w, -1);
                     }
+                    win.restore_position();
+                    win.apply_style();
+                }
+                "desktop-lyrics-x" | "desktop-lyrics-y" | "desktop-lyrics-bottom-margin" => {
+                    win.restore_position();
                     win.apply_style();
                 }
                 "desktop-lyrics-show-translation" => {
@@ -320,8 +337,8 @@ impl DesktopLyricsWindow {
 
         let (br, bg, bb) = hex_to_rgb(&bg_color);
 
-        // Derive a slightly smaller font for the next-line label.
-        let font_next = downsize_font(&font, 0.75);
+        let font_active_css = font_css_from_description(&font, 1.0);
+        let font_next_css = font_css_from_description(&font, 0.75);
 
         // Rough pixel-stroke approximation via 8-direction text-shadow.
         let stroke_shadow = if stroke_width > 0 {
@@ -340,17 +357,17 @@ impl DesktopLyricsWindow {
 
         let css = format!(
             ".desktop-lyrics-active {{
-                font: {font};
+                {font_active_css}
                 color: {active_color};
                 line-height: {line_height};
                 {stroke_shadow}
             }}
             .desktop-lyrics-translation {{
-                font: {font_next};
+                {font_next_css}
                 color: alpha({active_color}, 0.85);
             }}
             .desktop-lyrics-next {{
-                font: {font_next};
+                {font_next_css}
                 color: {inactive_color};
                 line-height: {line_height};
                 {stroke_shadow}
@@ -377,9 +394,22 @@ impl DesktopLyricsWindow {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
         *imp.css_provider.borrow_mut() = Some(provider);
+        if !imp.locked.get() {
+            self.reapply_lock_state_soon();
+        }
     }
 
     fn setup_drag(&self) {
+        self.add_drag_controllers(self.upcast_ref::<gtk::Widget>());
+        if let Some(container) = self.imp().container.borrow().as_ref() {
+            self.add_drag_controllers(container);
+        }
+        if let Some(handle) = self.imp().drag_handle.borrow().as_ref() {
+            self.add_drag_controllers(handle);
+        }
+    }
+
+    fn add_drag_controllers(&self, widget: &impl IsA<gtk::Widget>) {
         let click = gtk::GestureClick::new();
         click.set_button(1);
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -388,6 +418,9 @@ impl DesktopLyricsWindow {
         click.connect_pressed(move |gesture, _n_press, x, y| {
             let Some(win) = weak.upgrade() else { return };
             if win.imp().locked.get() {
+                return;
+            }
+            if win.imp().x11.borrow().is_some() && win.imp().xid.get().is_some() {
                 return;
             }
             if begin_window_manager_drag(gesture, &win, x, y) {
@@ -404,13 +437,15 @@ impl DesktopLyricsWindow {
         });
 
         let drag = gtk::GestureDrag::new();
+        drag.set_button(1);
         drag.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = self.downgrade();
-        drag.connect_drag_begin(move |_, _x, _y| {
+        drag.connect_drag_begin(move |gesture, _x, _y| {
             let Some(win) = weak.upgrade() else { return };
             if win.imp().locked.get() || win.imp().wm_drag_active.get() {
                 return;
             }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
             win.snapshot_manual_drag_origin();
         });
 
@@ -439,13 +474,8 @@ impl DesktopLyricsWindow {
             win.persist_position(x, y);
         });
 
-        if let Some(container) = self.imp().container.borrow().as_ref() {
-            container.add_controller(click);
-            container.add_controller(drag);
-        } else {
-            self.add_controller(click);
-            self.add_controller(drag);
-        }
+        widget.add_controller(click);
+        widget.add_controller(drag);
     }
 
     fn snapshot_manual_drag_origin(&self) {
@@ -541,6 +571,7 @@ impl DesktopLyricsWindow {
         self.restore_position();
         // Apply lock state (input passthrough).
         self.apply_lock_state(imp.locked.get());
+        self.reapply_lock_state_soon();
     }
 
     fn restore_position(&self) {
@@ -584,6 +615,11 @@ impl DesktopLyricsWindow {
         if let Some(handle) = imp.drag_handle.borrow().as_ref() {
             handle.set_visible(!locked);
         }
+        let cursor_name = if locked { None } else { Some("move") };
+        self.set_cursor_from_name(cursor_name);
+        if let Some(container) = imp.container.borrow().as_ref() {
+            container.set_cursor_from_name(cursor_name);
+        }
     }
 
     /// Toggle and persist the lock state.
@@ -597,6 +633,14 @@ impl DesktopLyricsWindow {
 
     pub fn is_locked(&self) -> bool {
         self.imp().locked.get()
+    }
+
+    fn reapply_lock_state_soon(&self) {
+        let weak = self.downgrade();
+        glib::idle_add_local_once(move || {
+            let Some(win) = weak.upgrade() else { return };
+            win.apply_lock_state(win.imp().locked.get());
+        });
     }
 
     fn start_clock(&self) {
@@ -630,6 +674,7 @@ impl DesktopLyricsWindow {
             let locked = self.imp().locked.get();
             let _ = helper.set_input_passthrough(xid, locked);
         }
+        self.reapply_lock_state_soon();
     }
 
     pub fn hide_window(&self) {
@@ -803,23 +848,6 @@ fn default_overlay_position(
 
 fn dragged_overlay_position(origin: (i32, i32), dx: f64, dy: f64) -> (i32, i32) {
     (origin.0 + dx.round() as i32, origin.1 + dy.round() as i32)
-}
-
-/// Best-effort: take a Pango font description like "Noto Sans Bold 32" and
-/// scale the trailing size by `factor`. If parsing fails, returns the input.
-fn downsize_font(font: &str, factor: f64) -> String {
-    let parts: Vec<&str> = font.rsplitn(2, ' ').collect();
-    if parts.len() != 2 {
-        return font.to_string();
-    }
-    let size_part = parts[0];
-    let prefix = parts[1];
-    if let Ok(size) = size_part.parse::<f64>() {
-        let new_size = (size * factor).max(8.0).round() as i64;
-        format!("{prefix} {new_size}")
-    } else {
-        font.to_string()
-    }
 }
 
 #[cfg(test)]

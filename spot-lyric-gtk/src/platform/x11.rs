@@ -15,7 +15,6 @@ use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use x11rb::connection::Connection as _;
 use x11rb::connection::RequestConnection;
-use x11rb::errors::ReplyError;
 use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::shape::{self, ConnectionExt as _, SK};
 use x11rb::protocol::xproto::{
@@ -204,9 +203,26 @@ impl X11Helper {
                 &[],
             )?;
         } else {
-            // Reset the input shape mask to NONE → defaults to bounding shape
-            // (i.e. normal hit testing).
-            conn.shape_mask(shape::SO::SET, SK::INPUT, xid, 0, 0, x11rb::NONE)?;
+            // Some compositors/window managers do not reliably restore the
+            // previous input region from a NONE mask after it was emptied.
+            // Set an explicit full-window input rectangle so the overlay
+            // receives pointer events again as soon as the user unlocks it.
+            let geometry = conn.get_geometry(xid)?.reply()?;
+            let rect = Rectangle {
+                x: 0,
+                y: 0,
+                width: geometry.width.max(1),
+                height: geometry.height.max(1),
+            };
+            conn.shape_rectangles(
+                shape::SO::SET,
+                SK::INPUT,
+                xproto::ClipOrdering::UNSORTED,
+                xid,
+                0,
+                0,
+                &[rect],
+            )?;
         }
         conn.flush()?;
         Ok(())
@@ -338,9 +354,3 @@ impl X11Helper {
         Ok(())
     }
 }
-
-// Suppress an unused-import warning when this file is compiled in isolation.
-#[allow(dead_code)]
-fn _force_use(_: Rectangle) {}
-#[allow(dead_code)]
-fn _force_reply_error(_: ReplyError) {}

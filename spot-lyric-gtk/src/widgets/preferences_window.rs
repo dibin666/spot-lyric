@@ -15,7 +15,10 @@ use crate::bridge::Command;
 use crate::config;
 use crate::dbus::types::{AuthSnapshot, LyricsSettings};
 use crate::dialogs::{auth_dialog, lyrics_match_dialog};
-use crate::utils::{rgba_from_hex, rgba_to_hex};
+use crate::utils::{
+    font_description_from_parts, font_family_matches, parse_font_description, rgba_from_hex,
+    rgba_to_hex, FONT_SIZE_OPTIONS, FONT_WEIGHT_OPTIONS,
+};
 
 mod imp {
     use super::*;
@@ -38,9 +41,6 @@ mod imp {
         pub manual_match_button: RefCell<Option<gtk::Button>>,
         pub manual_match_row: RefCell<Option<adw::ActionRow>>,
 
-        // Display
-        pub font_button: RefCell<Option<gtk::FontDialogButton>>,
-
         pub last_track_uri: RefCell<String>,
         pub last_track_label: RefCell<String>,
         pub last_auth: RefCell<Option<AuthSnapshot>>,
@@ -62,7 +62,6 @@ mod imp {
                 offset_spin: RefCell::new(None),
                 manual_match_button: RefCell::new(None),
                 manual_match_row: RefCell::new(None),
-                font_button: RefCell::new(None),
                 last_track_uri: RefCell::new(String::new()),
                 last_track_label: RefCell::new(String::new()),
                 last_auth: RefCell::new(None),
@@ -382,25 +381,114 @@ impl PreferencesWindow {
             .build();
 
         // ── 字体 ──
-        let font_group = adw::PreferencesGroup::builder().title("字体").build();
-
-        let font_dialog = gtk::FontDialog::builder().title("选择歌词字体").build();
-        let font_button = gtk::FontDialogButton::builder()
-            .dialog(&font_dialog)
-            .level(gtk::FontLevel::Font)
-            .valign(gtk::Align::Center)
+        let font_group = adw::PreferencesGroup::builder()
+            .title("字体")
+            .description("先在下拉选项中选择并查看预览，点击应用后写入桌面歌词")
             .build();
+
         let initial_font = settings.string("desktop-lyrics-font").to_string();
-        font_button.set_font_desc(&gtk::pango::FontDescription::from_string(&initial_font));
+        let initial_selection = parse_font_description(&initial_font);
+        let font_families = Rc::new(system_font_family_names(self.upcast_ref::<gtk::Widget>()));
+
+        let preview_label = gtk::Label::builder()
+            .css_classes(["spotlyric-font-preview"])
+            .halign(gtk::Align::Center)
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .use_markup(true)
+            .build();
+        let preview_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(12)
+            .css_classes(["spotlyric-font-preview-card"])
+            .build();
+        preview_box.append(&preview_label);
+        font_group.add(&preview_box);
+
+        let family_label_refs: Vec<&str> = font_families.iter().map(String::as_str).collect();
+        let family_model = gtk::StringList::new(&family_label_refs);
+        let family_combo = adw::ComboRow::builder()
+            .title("字体")
+            .subtitle("来自系统已安装字体")
+            .model(&family_model)
+            .build();
+        let initial_family_index = font_families
+            .iter()
+            .position(|family| font_family_matches(family, &initial_selection.family))
+            .unwrap_or(0);
+        family_combo.set_selected(initial_family_index as u32);
+        font_group.add(&family_combo);
+
+        let weight_model = gtk::StringList::new(&FONT_WEIGHT_OPTIONS);
+        let weight_combo = adw::ComboRow::builder()
+            .title("字重")
+            .model(&weight_model)
+            .build();
+        weight_combo.set_selected(initial_selection.weight_index as u32);
+        font_group.add(&weight_combo);
+
+        let size_labels: Vec<String> = FONT_SIZE_OPTIONS
+            .iter()
+            .map(|size| format!("{size} px"))
+            .collect();
+        let size_label_refs: Vec<&str> = size_labels.iter().map(String::as_str).collect();
+        let size_model = gtk::StringList::new(&size_label_refs);
+        let size_combo = adw::ComboRow::builder()
+            .title("字号")
+            .subtitle("桌面歌词高亮行大小")
+            .model(&size_model)
+            .build();
+        size_combo.set_selected(initial_selection.size_index as u32);
+        font_group.add(&size_combo);
+
+        update_font_preview(
+            &preview_label,
+            font_families.as_ref(),
+            &family_combo,
+            &weight_combo,
+            &size_combo,
+        );
+
+        for combo in [&family_combo, &weight_combo, &size_combo] {
+            let combo_for_signal = combo.clone();
+            let preview = preview_label.clone();
+            let families = font_families.clone();
+            let family = family_combo.clone();
+            let weight = weight_combo.clone();
+            let size = size_combo.clone();
+            combo_for_signal.connect_selected_notify(move |_| {
+                update_font_preview(&preview, families.as_ref(), &family, &weight, &size);
+            });
+        }
+
+        let apply_row = adw::ActionRow::builder()
+            .title("应用字体")
+            .subtitle("预览确认后再应用到桌面歌词浮层")
+            .build();
+        let apply_btn = gtk::Button::builder()
+            .label("应用")
+            .valign(gtk::Align::Center)
+            .css_classes(["suggested-action"])
+            .build();
         let s_clone = settings.clone();
-        font_button.connect_font_desc_notify(move |btn| {
-            if let Some(desc) = btn.font_desc() {
-                let _ = s_clone.set_string("desktop-lyrics-font", &desc.to_str());
+        let weak = self.downgrade();
+        let families = font_families.clone();
+        let family = family_combo.clone();
+        let weight = weight_combo.clone();
+        let size = size_combo.clone();
+        apply_btn.connect_clicked(move |_| {
+            let font = selected_font_description(families.as_ref(), &family, &weight, &size);
+            let _ = s_clone.set_string("desktop-lyrics-font", &font);
+            if let Some(win) = weak.upgrade() {
+                win.show_toast("字体已应用");
             }
         });
-        let font_row = adw::ActionRow::builder().title("歌词字体").build();
-        font_row.add_suffix(&font_button);
-        font_group.add(&font_row);
+        apply_row.add_suffix(&apply_btn);
+        font_group.add(&apply_row);
 
         let line_height = adw::SpinRow::with_range(1.0, 2.5, 0.05);
         line_height.set_title("行高倍数");
@@ -504,9 +592,6 @@ impl PreferencesWindow {
         window_group.add(&reset_row);
 
         page.add(&window_group);
-
-        let imp = self.imp();
-        *imp.font_button.borrow_mut() = Some(font_button);
 
         page
     }
@@ -748,6 +833,65 @@ impl PreferencesWindow {
     }
 }
 
+fn selected_font_description(
+    families: &[String],
+    family_combo: &adw::ComboRow,
+    weight_combo: &adw::ComboRow,
+    size_combo: &adw::ComboRow,
+) -> String {
+    let family = families
+        .get(combo_index(family_combo, families.len()))
+        .map(String::as_str)
+        .unwrap_or("Sans");
+    let weight_index = combo_index(weight_combo, FONT_WEIGHT_OPTIONS.len());
+    let size_index = combo_index(size_combo, FONT_SIZE_OPTIONS.len());
+    font_description_from_parts(family, weight_index, size_index)
+}
+
+fn update_font_preview(
+    label: &gtk::Label,
+    families: &[String],
+    family_combo: &adw::ComboRow,
+    weight_combo: &adw::ComboRow,
+    size_combo: &adw::ComboRow,
+) {
+    let font = selected_font_description(families, family_combo, weight_combo, size_combo);
+    label.set_markup(&font_preview_markup(&font));
+}
+
+fn system_font_family_names(widget: &gtk::Widget) -> Vec<String> {
+    let mut families: Vec<String> = widget
+        .pango_context()
+        .list_families()
+        .into_iter()
+        .map(|family| family.name().to_string())
+        .collect();
+
+    families.sort_by_key(|family| family.to_lowercase());
+    families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    if families.is_empty() {
+        families.push("Sans".into());
+    }
+
+    families
+}
+
+fn font_preview_markup(font: &str) -> String {
+    let sample = glib::markup_escape_text("天地帮你去躲 然开不见我");
+    let font = glib::markup_escape_text(&font);
+    format!("<span font_desc=\"{font}\">{sample}</span>\n<span size=\"small\">{font}</span>")
+}
+
+fn combo_index(combo: &adw::ComboRow, len: usize) -> usize {
+    let selected = combo.selected() as usize;
+    if selected < len {
+        selected
+    } else {
+        0
+    }
+}
+
 // ─── helper: bridge UI updates from std::mpsc into preference window calls ──
 
 pub fn install_ui_dispatcher(
@@ -905,5 +1049,12 @@ mod tests {
         assert!(manual_match_available("spotify:track:abc"));
         assert!(!manual_match_available(""));
         assert!(!manual_match_available("   "));
+    }
+
+    #[test]
+    fn font_preview_markup_is_valid_pango_markup() {
+        let markup = font_preview_markup("Noto Sans CJK SC Bold 32");
+
+        gtk::pango::parse_markup(&markup, '\0').expect("valid font preview markup");
     }
 }

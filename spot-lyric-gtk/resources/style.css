@@ -28,6 +28,16 @@ window {
   font-feature-settings: "tnum";
 }
 
+.spotlyric-font-preview-card {
+  border-radius: 14px;
+  padding: 18px 16px;
+  background-color: alpha(@accent_bg_color, 0.08);
+}
+
+.spotlyric-font-preview {
+  color: @accent_color;
+}
+
 /* ─── Desktop lyrics overlay ─── */
 .desktop-lyrics-window {
   background: transparent;
@@ -55,11 +65,18 @@ window {
 }
 
 .drag-handle {
-  min-width: 48px;
-  min-height: 4px;
-  border-radius: 2px;
-  background-color: alpha(white, 0.35);
-  margin-top: 6px;
+  min-width: 96px;
+  min-height: 22px;
+  border-radius: 999px;
+  background-color: alpha(white, 0.18);
+  margin-top: 8px;
+  padding: 2px 12px;
+}
+
+.drag-handle-label {
+  color: alpha(white, 0.72);
+  font-size: 0.78em;
+  font-weight: 700;
 }
 
 /* ─── Lyrics match dialog ─── */
