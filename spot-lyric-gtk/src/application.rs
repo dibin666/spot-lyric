@@ -12,6 +12,11 @@ use crate::widgets::{
     desktop_lyrics_window::DesktopLyricsWindow, preferences_window::PreferencesWindow,
 };
 
+fn present_preferences_window(prefs: &PreferencesWindow) {
+    prefs.set_visible(true);
+    prefs.present();
+}
+
 fn sync_tray_desktop_settings(
     settings: &gio::Settings,
     tray_state: &std::sync::Arc<std::sync::Mutex<tray::TrayState>>,
@@ -122,7 +127,7 @@ mod imp {
                             app_clone.activate_action("toggle-lock", None);
                         }
                         tray::TrayAction::Preferences => {
-                            app_clone.activate_action("preferences", None);
+                            app_clone.activate();
                         }
                         tray::TrayAction::MatchLyrics => {
                             app_clone.activate_action("match-lyrics", None);
@@ -166,7 +171,7 @@ mod imp {
             let prefs_action = gio::SimpleAction::new("preferences", None);
             let prefs_clone = prefs.clone();
             prefs_action.connect_activate(move |_, _| {
-                prefs_clone.present();
+                present_preferences_window(&prefs_clone);
             });
             app.add_action(&prefs_action);
             app.set_accels_for_action("app.preferences", &["<Ctrl>comma"]);
@@ -197,7 +202,7 @@ mod imp {
             let prefs_clone = prefs.clone();
             let match_lyrics_action = gio::SimpleAction::new("match-lyrics", None);
             match_lyrics_action.connect_activate(move |_, _| {
-                prefs_clone.present();
+                present_preferences_window(&prefs_clone);
                 let _ = prefs_clone.open_manual_match_dialog();
             });
             app.add_action(&match_lyrics_action);
@@ -224,7 +229,7 @@ mod imp {
             self.parent_activate();
 
             if let Some(prefs) = self.preferences_window.borrow().as_ref() {
-                prefs.present();
+                present_preferences_window(prefs);
             }
 
             if let Some(desktop) = self.desktop_lyrics.borrow().as_ref() {

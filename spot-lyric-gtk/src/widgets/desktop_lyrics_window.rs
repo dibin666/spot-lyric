@@ -50,6 +50,9 @@ mod imp {
 
         pub drag_start: Cell<(i32, i32)>,
         pub drag_origin: Cell<(i32, i32)>,
+        pub drag_pointer_origin: Cell<(i32, i32)>,
+        pub manual_drag_active: Cell<bool>,
+        pub manual_drag_tick_id: Cell<Option<glib::SourceId>>,
         pub wm_drag_active: Cell<bool>,
     }
 
@@ -76,6 +79,9 @@ mod imp {
                 xid: Cell::new(None),
                 drag_start: Cell::new((0, 0)),
                 drag_origin: Cell::new((0, 0)),
+                drag_pointer_origin: Cell::new((0, 0)),
+                manual_drag_active: Cell::new(false),
+                manual_drag_tick_id: Cell::new(None),
                 wm_drag_active: Cell::new(false),
             }
         }
@@ -118,6 +124,9 @@ mod imp {
 
         fn dispose(&self) {
             if let Some(id) = self.clock_tick_id.take() {
+                id.remove();
+            }
+            if let Some(id) = self.manual_drag_tick_id.take() {
                 id.remove();
             }
             if let (Some(handler), Some(settings)) = (
@@ -420,7 +429,8 @@ impl DesktopLyricsWindow {
             if win.imp().locked.get() {
                 return;
             }
-            if win.imp().x11.borrow().is_some() && win.imp().xid.get().is_some() {
+            if win.start_x11_manual_drag() {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
             }
             if begin_window_manager_drag(gesture, &win, x, y) {
@@ -431,6 +441,11 @@ impl DesktopLyricsWindow {
         let weak = self.downgrade();
         click.connect_released(move |_, _n_press, _x, _y| {
             let Some(win) = weak.upgrade() else { return };
+            if win.imp().manual_drag_active.get() {
+                win.update_x11_manual_drag_from_pointer();
+                win.stop_x11_manual_drag(true);
+                return;
+            }
             if win.imp().wm_drag_active.replace(false) {
                 win.persist_current_x11_position();
             }
@@ -442,7 +457,10 @@ impl DesktopLyricsWindow {
         let weak = self.downgrade();
         drag.connect_drag_begin(move |gesture, _x, _y| {
             let Some(win) = weak.upgrade() else { return };
-            if win.imp().locked.get() || win.imp().wm_drag_active.get() {
+            if win.imp().locked.get()
+                || win.imp().manual_drag_active.get()
+                || win.imp().wm_drag_active.get()
+            {
                 return;
             }
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -452,22 +470,22 @@ impl DesktopLyricsWindow {
         let weak = self.downgrade();
         drag.connect_drag_update(move |_, dx, dy| {
             let Some(win) = weak.upgrade() else { return };
-            if win.imp().locked.get() || win.imp().wm_drag_active.get() {
+            if win.imp().locked.get()
+                || win.imp().manual_drag_active.get()
+                || win.imp().wm_drag_active.get()
+            {
                 return;
             }
-            let (origin_x, origin_y) = win.imp().drag_origin.get();
-            let (new_x, new_y) = dragged_overlay_position((origin_x, origin_y), dx, dy);
-            let helper = win.imp().x11.borrow().as_ref().cloned();
-            if let (Some(helper), Some(xid)) = (helper, win.imp().xid.get()) {
-                let _ = helper.move_window(xid, new_x, new_y);
-            }
-            win.imp().drag_start.set((new_x, new_y));
+            win.update_manual_drag_from_delta(dx, dy);
         });
 
         let weak = self.downgrade();
         drag.connect_drag_end(move |_, _dx, _dy| {
             let Some(win) = weak.upgrade() else { return };
-            if win.imp().locked.get() || win.imp().wm_drag_active.get() {
+            if win.imp().locked.get()
+                || win.imp().manual_drag_active.get()
+                || win.imp().wm_drag_active.get()
+            {
                 return;
             }
             let (x, y) = win.imp().drag_start.get();
@@ -488,6 +506,9 @@ impl DesktopLyricsWindow {
             if let Ok((x, y)) = helper.window_position(xid) {
                 self.imp().drag_origin.set((x, y));
                 self.imp().drag_start.set((x, y));
+                if let Ok((pointer_x, pointer_y)) = helper.pointer_position() {
+                    self.imp().drag_pointer_origin.set((pointer_x, pointer_y));
+                }
                 return;
             }
             if let Ok(geometry) = helper.primary_monitor_geometry() {
@@ -510,8 +531,98 @@ impl DesktopLyricsWindow {
                 };
                 self.imp().drag_origin.set((x, y));
                 self.imp().drag_start.set((x, y));
+                if let Ok((pointer_x, pointer_y)) = helper.pointer_position() {
+                    self.imp().drag_pointer_origin.set((pointer_x, pointer_y));
+                }
             }
         }
+    }
+
+    fn start_x11_manual_drag(&self) -> bool {
+        let (Some(helper), Some(_xid)) = (
+            self.imp().x11.borrow().as_ref().cloned(),
+            self.imp().xid.get(),
+        ) else {
+            return false;
+        };
+
+        self.snapshot_manual_drag_origin();
+        if let Ok((pointer_x, pointer_y)) = helper.pointer_position() {
+            self.imp().drag_pointer_origin.set((pointer_x, pointer_y));
+        }
+
+        self.imp().manual_drag_active.set(true);
+        if let Some(id) = self.imp().manual_drag_tick_id.take() {
+            id.remove();
+        }
+
+        let weak = self.downgrade();
+        let id = glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            let Some(win) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
+            if win.imp().locked.get() {
+                win.imp().manual_drag_active.set(false);
+                win.imp().manual_drag_tick_id.take();
+                return glib::ControlFlow::Break;
+            }
+
+            if !win.imp().manual_drag_active.get() {
+                win.imp().manual_drag_tick_id.take();
+                return glib::ControlFlow::Break;
+            }
+
+            win.update_x11_manual_drag_from_pointer();
+            glib::ControlFlow::Continue
+        });
+        self.imp().manual_drag_tick_id.set(Some(id));
+        true
+    }
+
+    fn stop_x11_manual_drag(&self, persist: bool) {
+        if let Some(id) = self.imp().manual_drag_tick_id.take() {
+            id.remove();
+        }
+        if !self.imp().manual_drag_active.replace(false) {
+            return;
+        }
+        if persist {
+            self.persist_current_x11_position();
+        }
+    }
+
+    fn update_x11_manual_drag_from_pointer(&self) {
+        let (Some(helper), Some(xid)) = (
+            self.imp().x11.borrow().as_ref().cloned(),
+            self.imp().xid.get(),
+        ) else {
+            return;
+        };
+        let Ok((pointer_x, pointer_y)) = helper.pointer_position() else {
+            return;
+        };
+
+        let (origin_x, origin_y) = self.imp().drag_origin.get();
+        let (start_x, start_y) = self.imp().drag_pointer_origin.get();
+        let new_x = origin_x + (pointer_x - start_x);
+        let new_y = origin_y + (pointer_y - start_y);
+
+        if let Err(error) = helper.move_window(xid, new_x, new_y) {
+            tracing::warn!("manual X11 drag move failed: {error}");
+            return;
+        }
+        self.imp().drag_start.set((new_x, new_y));
+    }
+
+    fn update_manual_drag_from_delta(&self, dx: f64, dy: f64) {
+        let (origin_x, origin_y) = self.imp().drag_origin.get();
+        let (new_x, new_y) = dragged_overlay_position((origin_x, origin_y), dx, dy);
+        let helper = self.imp().x11.borrow().as_ref().cloned();
+        if let (Some(helper), Some(xid)) = (helper, self.imp().xid.get()) {
+            let _ = helper.move_window(xid, new_x, new_y);
+        }
+        self.imp().drag_start.set((new_x, new_y));
     }
 
     fn persist_position(&self, x: i32, y: i32) {

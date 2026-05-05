@@ -36,6 +36,7 @@ struct Atoms {
     net_wm_window_type: u32,
     net_wm_window_type_utility: u32,
     net_wm_desktop: u32,
+    net_wm_moveresize: u32,
     net_moveresize_window: u32,
     net_wm_pid: u32,
     wm_class: u32,
@@ -59,6 +60,7 @@ impl Atoms {
             net_wm_window_type: one(conn, "_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_utility: one(conn, "_NET_WM_WINDOW_TYPE_UTILITY")?,
             net_wm_desktop: one(conn, "_NET_WM_DESKTOP")?,
+            net_wm_moveresize: one(conn, "_NET_WM_MOVERESIZE")?,
             net_moveresize_window: one(conn, "_NET_MOVERESIZE_WINDOW")?,
             net_wm_pid: one(conn, "_NET_WM_PID")?,
             wm_class: u32::from(AtomEnum::WM_CLASS),
@@ -190,6 +192,22 @@ impl X11Helper {
     /// behind ours; `false` restores normal hit testing.
     pub fn set_input_passthrough(&self, xid: u32, passthrough: bool) -> Result<()> {
         let conn = &*self.conn;
+        let outer = self.outer_window(xid).unwrap_or(xid);
+
+        self.set_input_passthrough_for_window(xid, passthrough)?;
+        if outer != xid {
+            // Cinnamon/Muffin reparents managed windows.  Restoring the input
+            // shape only on the GTK client window can leave the WM frame with
+            // an empty input region, so apply the same state to the outermost
+            // frame window as well.
+            self.set_input_passthrough_for_window(outer, passthrough)?;
+        }
+        conn.flush()?;
+        Ok(())
+    }
+
+    fn set_input_passthrough_for_window(&self, xid: u32, passthrough: bool) -> Result<()> {
+        let conn = &*self.conn;
         if passthrough {
             // Empty rectangle list → input region is empty → window cannot
             // receive any pointer event.
@@ -224,6 +242,37 @@ impl X11Helper {
                 &[rect],
             )?;
         }
+        Ok(())
+    }
+
+    /// Ask the window manager to start an interactive move operation.
+    ///
+    /// Cinnamon/Muffin handles `_NET_WM_MOVERESIZE` more reliably for
+    /// undecorated utility windows than direct coordinate moves.
+    pub fn begin_interactive_move(&self, xid: u32, button: u32) -> Result<()> {
+        const _NET_WM_MOVERESIZE_MOVE: u32 = 8;
+        const SOURCE_APPLICATION: u32 = 1;
+
+        let conn = &*self.conn;
+        let pointer = conn.query_pointer(self.root)?.reply()?;
+        let event = ClientMessageEvent::new(
+            32,
+            xid,
+            self.atoms.net_wm_moveresize,
+            [
+                pointer.root_x as i32 as u32,
+                pointer.root_y as i32 as u32,
+                _NET_WM_MOVERESIZE_MOVE,
+                button.max(1),
+                SOURCE_APPLICATION,
+            ],
+        );
+        conn.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            event,
+        )?;
         conn.flush()?;
         Ok(())
     }
@@ -249,16 +298,23 @@ impl X11Helper {
             EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
             event,
         )?;
-        conn.configure_window(xid, &ConfigureWindowAux::new().x(x).y(y))?;
+
+        // Muffin can ignore direct ConfigureWindow requests sent to the GTK
+        // client window after it has reparented the window into a WM frame.
+        // Move the outermost child of the root window as the synchronous
+        // fallback so pointer-dragging remains responsive on Cinnamon.
+        let target = self.outer_window(xid).unwrap_or(xid);
+        conn.configure_window(target, &ConfigureWindowAux::new().x(x).y(y))?;
         conn.flush()?;
         Ok(())
     }
 
     /// Current top-left client-window position in root coordinates.
     pub fn window_position(&self, xid: u32) -> Result<(i32, i32)> {
+        let target = self.outer_window(xid).unwrap_or(xid);
         let reply = self
             .conn
-            .translate_coordinates(xid, self.root, 0, 0)?
+            .translate_coordinates(target, self.root, 0, 0)?
             .reply()?;
         if !reply.same_screen {
             return Err(anyhow!(
@@ -266,6 +322,12 @@ impl X11Helper {
             ));
         }
         Ok((reply.dst_x as i32, reply.dst_y as i32))
+    }
+
+    /// Current pointer position in root coordinates.
+    pub fn pointer_position(&self) -> Result<(i32, i32)> {
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        Ok((pointer.root_x as i32, pointer.root_y as i32))
     }
 
     /// Best-effort primary monitor geometry.
@@ -331,6 +393,26 @@ impl X11Helper {
             width: geometry.width as i32,
             height: geometry.height as i32,
         })
+    }
+
+    /// Return the outermost window that still belongs to this toplevel.
+    ///
+    /// Reparenting window managers such as Cinnamon's Muffin wrap the GTK
+    /// client XID in a WM-owned frame window.  The frame is the child of the
+    /// root window and is the window that actually moves on screen.
+    fn outer_window(&self, xid: u32) -> Result<u32> {
+        let conn = &*self.conn;
+        let mut current = xid;
+
+        for _ in 0..16 {
+            let tree = conn.query_tree(current)?.reply()?;
+            if tree.parent == x11rb::NONE || tree.parent == self.root {
+                return Ok(current);
+            }
+            current = tree.parent;
+        }
+
+        Err(anyhow!("X11 window parent chain is unexpectedly deep"))
     }
 
     fn send_state_change(&self, xid: u32, state_atom: u32) -> Result<()> {

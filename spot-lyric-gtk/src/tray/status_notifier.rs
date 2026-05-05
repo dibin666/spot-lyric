@@ -1,14 +1,17 @@
 use crate::bridge::Command;
 use crate::config;
-use gtk::glib;
 use ksni::{
     menu::{CheckmarkItem, StandardItem, SubMenu},
-    MenuItem, Tray,
+    Icon, MenuItem, Tray,
 };
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+const APP_ICON_RELATIVE_PATH: &str = "scalable/apps/cn.spotlyric.Gtk.svg";
+const TRAY_ICON_THEME_ENV: &str = "SPOT_LYRIC_ICON_THEME_PATH";
 
 #[derive(Default, Clone)]
 pub struct TrayState {
@@ -27,6 +30,202 @@ pub fn apply_desktop_settings_to_state(state: &mut TrayState, enabled: bool, loc
 
 pub fn apply_lyrics_provider_to_state(state: &mut TrayState, provider: &str) {
     state.preferred_provider = if provider == "qq" { "qq" } else { "netease" }.into();
+}
+
+fn local_icon_theme_path() -> String {
+    if let Ok(path) = std::env::var(TRAY_ICON_THEME_ENV) {
+        if !path.is_empty() && Path::new(&path).exists() {
+            return path;
+        }
+    }
+
+    let source_icon_theme = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons");
+    if source_icon_theme.join(APP_ICON_RELATIVE_PATH).is_file() {
+        return source_icon_theme.to_string_lossy().into_owned();
+    }
+
+    String::new()
+}
+
+fn tray_icon_pixmaps() -> Vec<Icon> {
+    vec![draw_tray_icon(64), draw_tray_icon(32), draw_tray_icon(22)]
+}
+
+fn draw_tray_icon(size: i32) -> Icon {
+    let side = size.max(1) as usize;
+    let mut data = vec![0; side * side * 4];
+
+    for y in 0..size {
+        for x in 0..size {
+            if in_rounded_rect(x, y, 1, 1, size - 1, size - 1, (size / 5).max(2)) {
+                let t = y as f32 / (size - 1).max(1) as f32;
+                let r = lerp(59, 29, t);
+                let g = lerp(130, 78, t);
+                let b = lerp(246, 216, t);
+                put_pixel(&mut data, side, x, y, 255, r, g, b);
+            }
+        }
+    }
+
+    let bubble_left = size * 5 / 32;
+    let bubble_top = size * 10 / 32;
+    let bubble_right = size * 27 / 32;
+    let bubble_bottom = size * 23 / 32;
+    let bubble_radius = (size * 2 / 32).max(2);
+    for y in bubble_top..bubble_bottom {
+        for x in bubble_left..bubble_right {
+            if in_rounded_rect(
+                x,
+                y,
+                bubble_left,
+                bubble_top,
+                bubble_right,
+                bubble_bottom,
+                bubble_radius,
+            ) || in_tail(x, y, size)
+            {
+                put_pixel(&mut data, side, x, y, 245, 255, 255, 255);
+            }
+        }
+    }
+
+    draw_round_bar(
+        &mut data,
+        side,
+        size * 8 / 32,
+        size * 13 / 32,
+        size * 14 / 32,
+        (size / 14).max(2),
+    );
+    draw_round_bar(
+        &mut data,
+        side,
+        size * 8 / 32,
+        size * 16 / 32,
+        size * 11 / 32,
+        (size / 18).max(1),
+    );
+    draw_round_bar(
+        &mut data,
+        side,
+        size * 8 / 32,
+        size * 19 / 32,
+        size * 9 / 32,
+        (size / 18).max(1),
+    );
+    draw_note(&mut data, side, size);
+
+    Icon {
+        width: size,
+        height: size,
+        data,
+    }
+}
+
+fn lerp(start: u8, end: u8, t: f32) -> u8 {
+    (start as f32 + (end as f32 - start as f32) * t).round() as u8
+}
+
+fn put_pixel(data: &mut [u8], side: usize, x: i32, y: i32, a: u8, r: u8, g: u8, b: u8) {
+    if x < 0 || y < 0 || x as usize >= side || y as usize >= side {
+        return;
+    }
+    let idx = ((y as usize * side) + x as usize) * 4;
+    data[idx] = a;
+    data[idx + 1] = r;
+    data[idx + 2] = g;
+    data[idx + 3] = b;
+}
+
+fn in_rounded_rect(
+    x: i32,
+    y: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    radius: i32,
+) -> bool {
+    if x < left || x >= right || y < top || y >= bottom {
+        return false;
+    }
+
+    let radius = radius.max(1);
+    let cx = if x < left + radius {
+        left + radius
+    } else if x >= right - radius {
+        right - radius - 1
+    } else {
+        x
+    };
+    let cy = if y < top + radius {
+        top + radius
+    } else if y >= bottom - radius {
+        bottom - radius - 1
+    } else {
+        y
+    };
+
+    let dx = x - cx;
+    let dy = y - cy;
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn in_tail(x: i32, y: i32, size: i32) -> bool {
+    let tail_top = size * 21 / 32;
+    let tail_bottom = size * 27 / 32;
+    let tail_left = size * 14 / 32;
+    let tail_right = size * 19 / 32;
+    y >= tail_top
+        && y < tail_bottom
+        && x >= tail_left
+        && x < tail_right
+        && x - tail_left <= tail_bottom - y
+}
+
+fn draw_round_bar(data: &mut [u8], side: usize, x: i32, y: i32, width: i32, height: i32) {
+    for yy in y..(y + height) {
+        for xx in x..(x + width) {
+            if in_rounded_rect(xx, yy, x, y, x + width, y + height, (height / 2).max(1)) {
+                put_pixel(data, side, xx, yy, 255, 29, 78, 216);
+            }
+        }
+    }
+}
+
+fn draw_note(data: &mut [u8], side: usize, size: i32) {
+    let blue = (255, 29, 78, 216);
+    let stem_x = size * 23 / 32;
+    let stem_y = size * 12 / 32;
+    let stem_w = (size / 14).max(2);
+    let stem_h = size * 9 / 32;
+
+    for y in stem_y..(stem_y + stem_h) {
+        for x in stem_x..(stem_x + stem_w) {
+            put_pixel(data, side, x, y, blue.0, blue.1, blue.2, blue.3);
+        }
+    }
+
+    let head_cx = stem_x - size * 2 / 32;
+    let head_cy = stem_y + stem_h;
+    let rx = (size * 5 / 64).max(2);
+    let ry = (size * 4 / 64).max(2);
+    for y in (head_cy - ry)..=(head_cy + ry) {
+        for x in (head_cx - rx)..=(head_cx + rx) {
+            let dx = (x - head_cx) as f32 / rx as f32;
+            let dy = (y - head_cy) as f32 / ry as f32;
+            if dx * dx + dy * dy <= 1.0 {
+                put_pixel(data, side, x, y, blue.0, blue.1, blue.2, blue.3);
+            }
+        }
+    }
+
+    for y in stem_y..(stem_y + size * 3 / 32) {
+        let row_w = (size * 6 / 32) - (y - stem_y);
+        for x in stem_x..(stem_x + row_w.max(1)) {
+            put_pixel(data, side, x, y, blue.0, blue.1, blue.2, blue.3);
+        }
+    }
 }
 
 pub enum TrayAction {
@@ -81,8 +280,28 @@ impl StatusNotifierTray {
 }
 
 impl Tray for StatusNotifierTray {
+    fn id(&self) -> String {
+        config::APP_ID.to_string()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.action_tx.send(TrayAction::Preferences);
+    }
+
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.action_tx.send(TrayAction::Preferences);
+    }
+
     fn icon_name(&self) -> String {
         config::APP_ID.to_string()
+    }
+
+    fn icon_theme_path(&self) -> String {
+        local_icon_theme_path()
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        tray_icon_pixmaps()
     }
 
     fn title(&self) -> String {
@@ -107,7 +326,7 @@ impl Tray for StatusNotifierTray {
             icon_name: config::APP_ID.to_string(),
             title: "Spot-Lyric".to_string(),
             description: desc,
-            icon_pixmap: Vec::new(),
+            icon_pixmap: tray_icon_pixmaps(),
         }
     }
 
@@ -243,5 +462,26 @@ mod tests {
 
         apply_lyrics_provider_to_state(&mut state, "invalid");
         assert_eq!(state.preferred_provider, "netease");
+    }
+
+    #[test]
+    fn tray_icon_pixmaps_are_valid_argb_buffers() {
+        let pixmaps = tray_icon_pixmaps();
+
+        assert!(!pixmaps.is_empty());
+        for icon in pixmaps {
+            assert!(icon.width > 0);
+            assert!(icon.height > 0);
+            assert_eq!(icon.data.len(), (icon.width * icon.height * 4) as usize);
+            assert!(icon.data.chunks_exact(4).any(|pixel| pixel[0] > 0));
+        }
+    }
+
+    #[test]
+    fn source_icon_theme_path_exists_in_development() {
+        let path = local_icon_theme_path();
+
+        assert!(!path.is_empty());
+        assert!(Path::new(&path).exists());
     }
 }

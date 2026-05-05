@@ -61,6 +61,10 @@ STAMP_PATH="$TARGET_DIR/.${APP_NAME}-${PROFILE}.inputs.sha256"
 SCHEMA_SOURCE="$GTK_DIR/data/cn.spotlyric.Gtk.gschema.xml"
 SCHEMA_TARGET_DIR="$TARGET_DIR/$PROFILE/gsettings-schemas"
 SCHEMA_COMPILED="$SCHEMA_TARGET_DIR/gschemas.compiled"
+ICON_SOURCE="$GTK_DIR/data/icons/scalable/apps/cn.spotlyric.Gtk.svg"
+ICON_THEME_DIR="$TARGET_DIR/$PROFILE/icons"
+ICON_THEME_INDEX="$ICON_THEME_DIR/hicolor/index.theme"
+ICON_TARGET="$ICON_THEME_DIR/hicolor/scalable/apps/cn.spotlyric.Gtk.svg"
 
 INPUT_PATHS=(
   "$GTK_DIR/Cargo.toml"
@@ -175,6 +179,37 @@ prepare_gsettings_schema() {
   export GSETTINGS_SCHEMA_DIR="$SCHEMA_TARGET_DIR"
 }
 
+prepare_tray_icon() {
+  if [[ ! -f "$ICON_SOURCE" ]]; then
+    echo "[run] 启动失败，未找到托盘图标: $ICON_SOURCE" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname -- "$ICON_TARGET")"
+  if [[ ! -f "$ICON_THEME_INDEX" ]]; then
+    cat > "$ICON_THEME_INDEX" <<'EOF'
+[Icon Theme]
+Name=hicolor
+Comment=Fallback icon theme for Spot-Lyric development runs
+Directories=scalable/apps
+
+[scalable/apps]
+Size=128
+Type=Scalable
+Context=Applications
+MinSize=16
+MaxSize=512
+EOF
+  fi
+
+  if [[ ! -f "$ICON_TARGET" || "$ICON_SOURCE" -nt "$ICON_TARGET" ]]; then
+    echo "[run] 准备托盘图标: ${ICON_TARGET#$ROOT_DIR/}"
+    cp "$ICON_SOURCE" "$ICON_TARGET"
+  fi
+
+  export SPOT_LYRIC_ICON_THEME_PATH="$ICON_THEME_DIR"
+}
+
 if reason="$(needs_build_reason)"; then
   echo "[run] 需要编译：$reason"
   build_app
@@ -188,6 +223,7 @@ if [[ ! -x "$BIN_PATH" ]]; then
 fi
 
 prepare_gsettings_schema
+prepare_tray_icon
 
 echo "[run] 启动: ${BIN_PATH#$ROOT_DIR/} ${APP_ARGS[*]}"
 exec "$BIN_PATH" "${APP_ARGS[@]}"
