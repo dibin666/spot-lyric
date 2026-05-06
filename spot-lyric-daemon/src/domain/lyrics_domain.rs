@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{future::Future, str::FromStr};
 
 use serde_json::Value;
 
@@ -67,27 +67,26 @@ impl LyricsDomain {
         }
 
         if let Some(track) = self.playback.current_track_for_uri(track_uri).await {
-            let spotify_payload = self
-                .spotify_or_unmatched(Some(track_uri), Some(track.id.as_str()))
-                .await?;
-            if is_usable_spotify_lyrics(&spotify_payload) {
-                return Ok(spotify_payload);
-            }
-
-            let ordered_candidates = self
-                .search_candidates_for_track(&track, settings.preferred_provider.as_str())
-                .await?;
-            for candidate in ordered_candidates {
-                let payload = self
-                    .get_lyrics_for_candidate(Some(track_uri), Some(track.id.as_str()), &candidate)
-                    .await?;
-                let payload = apply_timing_offset(&payload, settings.lyrics_timing_offset_ms);
-                if has_usable_lyrics(&payload) {
-                    return Ok(payload);
-                }
-            }
-
-            return Ok(spotify_payload);
+            let external_track_uri = track_uri.to_string();
+            let external_track_id = track.id.clone();
+            return external_lyrics_or_spotify_fallback(
+                || self.search_candidates_for_track(&track, settings.preferred_provider.as_str()),
+                |candidate| {
+                    let external_track_uri = external_track_uri.clone();
+                    let external_track_id = external_track_id.clone();
+                    async move {
+                        self.get_lyrics_for_candidate(
+                            Some(external_track_uri.as_str()),
+                            Some(external_track_id.as_str()),
+                            &candidate,
+                        )
+                        .await
+                    }
+                },
+                async { self.spotify_or_unmatched(Some(track_uri), Some(track.id.as_str())).await },
+                settings.lyrics_timing_offset_ms,
+            )
+            .await;
         }
 
         self.spotify_or_unmatched(Some(track_uri), fallback_track_id.as_deref())
@@ -309,8 +308,28 @@ impl LyricsDomain {
     }
 }
 
-fn is_usable_spotify_lyrics(payload: &LyricsPayload) -> bool {
-    payload.source == "spotify" && has_usable_lyrics(payload)
+async fn external_lyrics_or_spotify_fallback<Search, SearchFuture, Fetch, FetchFuture, SpotifyFuture>(
+    search_external_candidates: Search,
+    mut fetch_external_lyrics: Fetch,
+    spotify_fallback: SpotifyFuture,
+    timing_offset_ms: i32,
+) -> Result<LyricsPayload>
+where
+    Search: FnOnce() -> SearchFuture,
+    SearchFuture: Future<Output = Result<Vec<StoredLyricsCandidate>>>,
+    Fetch: FnMut(StoredLyricsCandidate) -> FetchFuture,
+    FetchFuture: Future<Output = Result<LyricsPayload>>,
+    SpotifyFuture: Future<Output = Result<LyricsPayload>>,
+{
+    for candidate in search_external_candidates().await? {
+        let payload = fetch_external_lyrics(candidate).await?;
+        let payload = apply_timing_offset(&payload, timing_offset_ms);
+        if has_usable_lyrics(&payload) {
+            return Ok(payload);
+        }
+    }
+
+    spotify_fallback.await
 }
 
 fn empty_lyrics_payload(
@@ -508,6 +527,10 @@ impl LyricsSearchProvider for QqMusicLyricsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     #[test]
     fn parses_manual_provider_links() {
@@ -556,5 +579,84 @@ mod tests {
         assert_eq!(payload.track_id.as_deref(), Some("abc"));
         assert_eq!(payload.lines[0].text, "第一句");
         assert_eq!(payload.lines[0].start_time_ms, 1234);
+    }
+
+    #[tokio::test]
+    async fn external_lyrics_are_used_before_spotify_fallback() {
+        let spotify_called = Arc::new(AtomicBool::new(false));
+        let spotify_called_for_fallback = spotify_called.clone();
+
+        let payload = external_lyrics_or_spotify_fallback(
+            || async { Ok(vec![test_candidate("netease")]) },
+            |_| async { Ok(test_payload("netease", "外部歌词")) },
+            async move {
+                spotify_called_for_fallback.store(true, Ordering::SeqCst);
+                Ok(test_payload("spotify", "Spotify 歌词"))
+            },
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.source, "netease");
+        assert_eq!(payload.lines[0].text, "外部歌词");
+        assert!(!spotify_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn spotify_is_used_after_external_candidates_have_no_usable_lyrics() {
+        let spotify_called = Arc::new(AtomicBool::new(false));
+        let spotify_called_for_fallback = spotify_called.clone();
+
+        let payload = external_lyrics_or_spotify_fallback(
+            || async { Ok(vec![test_candidate("qq")]) },
+            |_| async { Ok(empty_lyrics_payload(None, Some("spotify-track"), "qq")) },
+            async move {
+                spotify_called_for_fallback.store(true, Ordering::SeqCst);
+                Ok(test_payload("spotify", "Spotify 歌词"))
+            },
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.source, "spotify");
+        assert_eq!(payload.lines[0].text, "Spotify 歌词");
+        assert!(spotify_called.load(Ordering::SeqCst));
+    }
+
+    fn test_candidate(provider: &str) -> StoredLyricsCandidate {
+        StoredLyricsCandidate {
+            album: "Album".into(),
+            artists: vec!["Artist".into()],
+            duration_ms: Some(180_000),
+            id: "123".into(),
+            mid: if provider == "qq" {
+                Some("mid123".into())
+            } else {
+                None
+            },
+            provider: provider.into(),
+            score: None,
+            title: "Song".into(),
+        }
+    }
+
+    fn test_payload(source: &str, text: &str) -> LyricsPayload {
+        LyricsPayload {
+            track_uri: Some("spotify:track:abc".into()),
+            track_id: Some("abc".into()),
+            language: None,
+            provider: None,
+            source: source.into(),
+            sync_type: "line".into(),
+            lines: vec![LyricsLine {
+                text: text.into(),
+                translated_text: None,
+                start_time_ms: 0,
+                end_time_ms: 1_000,
+                words: Vec::new(),
+            }],
+        }
     }
 }
