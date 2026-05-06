@@ -45,6 +45,7 @@ mod imp {
 
         pub last_track_uri: RefCell<String>,
         pub last_track_label: RefCell<String>,
+        pub last_track_search_query: RefCell<String>,
         pub last_auth: RefCell<Option<AuthSnapshot>>,
         pub last_settings: RefCell<Option<LyricsSettings>>,
         pub suppress_signals: Cell<bool>,
@@ -67,6 +68,7 @@ mod imp {
                 lyrics_preview: RefCell::new(None),
                 last_track_uri: RefCell::new(String::new()),
                 last_track_label: RefCell::new(String::new()),
+                last_track_search_query: RefCell::new(String::new()),
                 last_auth: RefCell::new(None),
                 last_settings: RefCell::new(None),
                 suppress_signals: Cell::new(false),
@@ -779,12 +781,14 @@ impl PreferencesWindow {
             return false;
         }
         let track_label = self.imp().last_track_label.borrow().clone();
+        let track_search_query = self.imp().last_track_search_query.borrow().clone();
         let Some(tx) = self.imp().cmd_tx.borrow().as_ref().cloned() else {
             return false;
         };
         lyrics_match_dialog::show(
             self.upcast_ref::<gtk::Widget>(),
             &track_label,
+            &track_search_query,
             &track_uri,
             tx,
         );
@@ -802,6 +806,8 @@ impl PreferencesWindow {
             format!("{track_name} — {artist_name}")
         };
         *imp.last_track_label.borrow_mut() = label;
+        *imp.last_track_search_query.borrow_mut() =
+            manual_match_search_query(track_name, artist_name);
 
         let available = manual_match_available(track_uri);
         if let Some(btn) = imp.manual_match_button.borrow().as_ref() {
@@ -1089,6 +1095,19 @@ fn manual_match_available(track_uri: &str) -> bool {
     !track_uri.trim().is_empty()
 }
 
+fn manual_match_search_query(track_name: &str, artist_name: &str) -> String {
+    let track_name = track_name.trim();
+    if track_name.is_empty() {
+        return String::new();
+    }
+    let artist_name = artist_name.trim();
+    if artist_name.is_empty() {
+        track_name.to_string()
+    } else {
+        format!("{track_name} {artist_name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1137,16 @@ mod tests {
         assert!(manual_match_available("spotify:track:abc"));
         assert!(!manual_match_available(""));
         assert!(!manual_match_available("   "));
+    }
+
+    #[test]
+    fn manual_match_search_query_includes_artist_without_display_separator() {
+        assert_eq!(
+            manual_match_search_query("Song Title", "Artist Name"),
+            "Song Title Artist Name"
+        );
+        assert_eq!(manual_match_search_query("Song Title", ""), "Song Title");
+        assert_eq!(manual_match_search_query("", "Artist Name"), "");
     }
 
     #[test]

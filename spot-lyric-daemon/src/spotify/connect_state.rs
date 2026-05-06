@@ -30,7 +30,7 @@ const PLAYER_API_BASE: &str = "https://api.spotify.com/v1/me/player";
 const CURRENTLY_PLAYING_API: &str = "https://api.spotify.com/v1/me/player/currently-playing";
 const WEB_PLAYER_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CACHED_PLAYING_EXTRAPOLATION: Duration = Duration::from_secs(3);
-const MAX_TIMESTAMP_POSITION_EXTRAPOLATION: Duration = Duration::from_secs(3);
+const MAX_FRESH_TIMESTAMP_AGE: Duration = Duration::from_secs(3);
 const WEB_PLAYER_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 const CONNECT_STATE_ERROR_BACKOFF: Duration = Duration::from_secs(60);
 const DEALER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -883,9 +883,10 @@ fn correct_position_for_timestamp(
             let elapsed_ms = chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(timestamp)
-                .max(0)
-                .min(MAX_TIMESTAMP_POSITION_EXTRAPOLATION.as_millis() as i64);
-            corrected = corrected.saturating_add(elapsed_ms);
+                .max(0);
+            if elapsed_ms <= MAX_FRESH_TIMESTAMP_AGE.as_millis() as i64 {
+                corrected = corrected.saturating_add(elapsed_ms);
+            }
         }
     }
     if duration_ms > 0 {
@@ -1206,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn playing_position_caps_stale_timestamp_extrapolation() {
+    fn playing_position_keeps_seeked_progress_when_timestamp_is_stale() {
         let raw = json!({
             "timestamp": chrono::Utc::now().timestamp_millis() - 30_000,
             "progress_ms": 42_000,
@@ -1224,8 +1225,8 @@ mod tests {
 
         assert!(snapshot.state.is_playing);
         assert!(
-            (44_500..=45_500).contains(&snapshot.state.position_ms),
-            "stale timestamp correction should be capped, got {}",
+            (42_000..=42_100).contains(&snapshot.state.position_ms),
+            "stale timestamp after seek should not move fresh progress, got {}",
             snapshot.state.position_ms
         );
     }

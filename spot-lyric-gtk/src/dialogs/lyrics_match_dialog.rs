@@ -85,6 +85,7 @@ impl LyricsMatchDialogInner {
 pub fn show(
     parent: &gtk::Widget,
     track_label: &str,
+    track_search_query: &str,
     track_uri: &str,
     cmd_tx: tokio_mpsc::UnboundedSender<Command>,
 ) {
@@ -122,7 +123,7 @@ pub fn show(
         .build();
 
     let search_entry = gtk::Entry::builder()
-        .text(track_label)
+        .text(track_search_query)
         .hexpand(true)
         .placeholder_text("搜索 NetEase / QQ 链接或关键词")
         .build();
@@ -183,7 +184,7 @@ pub fn show(
 
     // Auto-search on open
     let _ = cmd_tx.send(Command::SearchLyricsMatches {
-        query: track_label.to_string(),
+        query: track_search_query.to_string(),
     });
 }
 
