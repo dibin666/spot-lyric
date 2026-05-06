@@ -809,12 +809,23 @@ impl DesktopLyricsWindow {
         let changed = imp.current_track_uri.borrow().as_str() != state.track_uri.as_str();
         if changed {
             *imp.current_track_uri.borrow_mut() = state.track_uri.clone();
+            imp.clock.reset();
             self.set_lyrics(&LyricsPayload::default());
         }
 
         // Reset clock so insertion happens at the daemon's reported position.
-        imp.clock
-            .snapshot(state.position_ms, state.duration_ms, state.is_playing);
+        let position_ms =
+            imp.clock
+                .snapshot(state.position_ms, state.duration_ms, state.is_playing);
+        tracing::debug!(
+            target: "spot_lyric_gtk::timeline",
+            surface = "desktop",
+            raw_position_ms = state.position_ms,
+            estimated_position_ms = position_ms,
+            is_playing = state.is_playing,
+            track_uri = %state.track_uri,
+            "playback snapshot applied"
+        );
 
         // If we have no lyrics, fall back to track label on the active line.
         if imp.lyrics.borrow().is_empty() {
@@ -827,7 +838,7 @@ impl DesktopLyricsWindow {
         } else {
             // Render the daemon snapshot immediately so pause/resume/seek events
             // do not wait for the next interpolation tick.
-            self.update_active_line(state.position_ms);
+            self.update_active_line(position_ms);
         }
     }
 
@@ -864,9 +875,20 @@ impl DesktopLyricsWindow {
             .iter()
             .rposition(|line| line.start_time_ms <= position_ms);
 
-        if new_index == imp.active_index.get() {
+        let previous_index = imp.active_index.get();
+        if new_index == previous_index {
             return;
         }
+        tracing::debug!(
+            target: "spot_lyric_gtk::timeline",
+            surface = "desktop",
+            position_ms,
+            previous_index = ?previous_index,
+            new_index = ?new_index,
+            line_start_ms = new_index.and_then(|idx| lines.get(idx).map(|line| line.start_time_ms)),
+            next_start_ms = new_index.and_then(|idx| lines.get(idx + 1).map(|line| line.start_time_ms)),
+            "active lyric line changed"
+        );
         imp.active_index.set(new_index);
 
         let show_translation = imp.show_translation.get();

@@ -8,12 +8,15 @@
 use std::cell::Cell;
 use std::time::Instant;
 
+const MAX_SNAPSHOT_BACKWARD_DRIFT_MS: i64 = 1_500;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PositionClock {
     baseline_position_ms: i64,
     baseline_at: Option<Instant>,
     duration_ms: i64,
     is_playing: bool,
+    last_snapshot_position_ms: Option<i64>,
 }
 
 impl Default for PositionClock {
@@ -23,17 +26,62 @@ impl Default for PositionClock {
             baseline_at: None,
             duration_ms: 0,
             is_playing: false,
+            last_snapshot_position_ms: None,
         }
     }
 }
 
 impl PositionClock {
     /// Reset to the latest snapshot from the daemon.
-    pub fn snapshot(&mut self, position_ms: i64, duration_ms: i64, is_playing: bool) {
-        self.baseline_position_ms = position_ms.max(0);
+    pub fn snapshot(&mut self, position_ms: i64, duration_ms: i64, is_playing: bool) -> i64 {
+        let raw_position_ms = position_ms.max(0);
+        let duration_ms = duration_ms.max(0);
+        let before = self.estimate();
+        let position_ms = self.stable_snapshot_position(raw_position_ms, duration_ms, is_playing);
+        let ignored_backward_drift = is_playing && self.is_playing && position_ms > raw_position_ms;
+        tracing::debug!(
+            target: "spot_lyric_gtk::timeline",
+            raw_position_ms,
+            stable_position_ms = position_ms,
+            before_estimate_ms = before,
+            duration_ms,
+            is_playing,
+            ignored_backward_drift,
+            "position clock snapshot"
+        );
+        self.baseline_position_ms = position_ms;
         self.baseline_at = Some(Instant::now());
-        self.duration_ms = duration_ms.max(0);
+        self.duration_ms = duration_ms;
         self.is_playing = is_playing;
+        self.last_snapshot_position_ms = Some(raw_position_ms);
+        self.estimate()
+    }
+
+    fn stable_snapshot_position(
+        &self,
+        position_ms: i64,
+        duration_ms: i64,
+        is_playing: bool,
+    ) -> i64 {
+        let current = self.estimate();
+        let continuous_playback = self.is_playing && is_playing;
+        let backward_snapshot = current > position_ms;
+        let large_backward_seek = self
+            .last_snapshot_position_ms
+            .map(|previous| previous - position_ms > MAX_SNAPSHOT_BACKWARD_DRIFT_MS)
+            .unwrap_or(false);
+        let stale_backward_snapshot =
+            continuous_playback && backward_snapshot && !large_backward_seek;
+        let stable = if stale_backward_snapshot {
+            current
+        } else {
+            position_ms
+        };
+        if duration_ms > 0 {
+            stable.min(duration_ms)
+        } else {
+            stable
+        }
     }
 
     pub fn is_playing(&self) -> bool {
@@ -65,14 +113,19 @@ impl CellClock {
         Self(Cell::new(PositionClock::default()))
     }
 
-    pub fn snapshot(&self, position_ms: i64, duration_ms: i64, is_playing: bool) {
+    pub fn snapshot(&self, position_ms: i64, duration_ms: i64, is_playing: bool) -> i64 {
         let mut clock = self.0.get();
-        clock.snapshot(position_ms, duration_ms, is_playing);
+        let position = clock.snapshot(position_ms, duration_ms, is_playing);
         self.0.set(clock);
+        position
     }
 
     pub fn estimate(&self) -> i64 {
         self.0.get().estimate()
+    }
+
+    pub fn reset(&self) {
+        self.0.set(PositionClock::default());
     }
 }
 
@@ -110,5 +163,52 @@ mod tests {
     fn estimate_is_zero_until_first_snapshot() {
         let clock = PositionClock::default();
         assert_eq!(clock.estimate(), 0);
+    }
+
+    #[test]
+    fn playing_snapshot_ignores_small_backward_drift() {
+        let mut clock = PositionClock::default();
+        clock.snapshot(10_000, 60_000, true);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let before = clock.estimate();
+
+        clock.snapshot(9_950, 60_000, true);
+        let after = clock.estimate();
+
+        assert!(
+            after >= before - 5,
+            "small stale backward snapshots should not rewind playback, before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn playing_snapshot_accepts_large_backward_seek() {
+        let mut clock = PositionClock::default();
+        clock.snapshot(30_000, 60_000, true);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        clock.snapshot(10_000, 60_000, true);
+        let estimate = clock.estimate();
+
+        assert!(
+            (10_000..=10_080).contains(&estimate),
+            "large backward jumps are user seeks and must be accepted, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn playing_snapshot_ignores_repeated_stale_backward_position() {
+        let mut clock = PositionClock::default();
+        clock.snapshot(3_000, 60_000, true);
+        clock.baseline_at = Some(Instant::now() - std::time::Duration::from_millis(2_100));
+        let before = clock.estimate();
+
+        clock.snapshot(3_000, 60_000, true);
+        let after = clock.estimate();
+
+        assert!(
+            after >= before - 5,
+            "repeated stale snapshots should not rewind playback, before={before}, after={after}"
+        );
     }
 }

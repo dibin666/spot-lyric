@@ -9,7 +9,8 @@ use crate::bridge;
 use crate::config;
 use crate::tray;
 use crate::widgets::{
-    desktop_lyrics_window::DesktopLyricsWindow, preferences_window::PreferencesWindow,
+    desktop_lyrics_window::DesktopLyricsWindow, full_lyrics_window::FullLyricsWindow,
+    preferences_window::PreferencesWindow,
 };
 
 fn present_preferences_window(prefs: &PreferencesWindow) {
@@ -41,6 +42,7 @@ mod imp {
     pub struct SpotLyricApplication {
         pub preferences_window: RefCell<Option<PreferencesWindow>>,
         pub desktop_lyrics: RefCell<Option<DesktopLyricsWindow>>,
+        pub full_lyrics: RefCell<Option<FullLyricsWindow>>,
         pub tray_state: std::sync::Arc<std::sync::Mutex<tray::TrayState>>,
         pub tray_handle: Rc<RefCell<Option<tray::TrayHandle>>>,
         pub backend_runtime: RefCell<BackendRuntime>,
@@ -54,6 +56,7 @@ mod imp {
             Self {
                 preferences_window: RefCell::new(None),
                 desktop_lyrics: RefCell::new(None),
+                full_lyrics: RefCell::new(None),
                 tray_state: std::sync::Arc::new(std::sync::Mutex::new(tray::TrayState::default())),
                 tray_handle: Rc::new(RefCell::new(None)),
                 backend_runtime: RefCell::new(BackendRuntime::default()),
@@ -149,12 +152,15 @@ mod imp {
             prefs.attach_bridge(cmd_tx.cmd_tx.clone());
 
             let desktop = DesktopLyricsWindow::new(&*app);
+            let full_lyrics = FullLyricsWindow::new(&*app);
+            prefs.attach_full_lyrics_window(full_lyrics.clone());
 
             // Setup dispatcher
             crate::widgets::preferences_window::install_ui_dispatcher(
                 &prefs,
                 ui_rx,
                 desktop.clone(),
+                full_lyrics.clone(),
                 self.tray_state.clone(),
                 self.tray_handle.clone(),
             );
@@ -210,6 +216,7 @@ mod imp {
 
             *self.preferences_window.borrow_mut() = Some(prefs);
             *self.desktop_lyrics.borrow_mut() = Some(desktop);
+            *self.full_lyrics.borrow_mut() = Some(full_lyrics);
         }
 
         fn shutdown(&self) {
@@ -230,6 +237,9 @@ mod imp {
 
             if let Some(prefs) = self.preferences_window.borrow().as_ref() {
                 present_preferences_window(prefs);
+                if let Some(full) = self.full_lyrics.borrow().as_ref() {
+                    full.present_locked_beside(prefs);
+                }
             }
 
             if let Some(desktop) = self.desktop_lyrics.borrow().as_ref() {

@@ -78,8 +78,16 @@ pub struct X11Helper {
     atoms: Arc<Atoms>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowGeometry {
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -279,17 +287,48 @@ impl X11Helper {
 
     /// Move window to absolute screen coordinates.
     pub fn move_window(&self, xid: u32, x: i32, y: i32) -> Result<()> {
+        self.move_resize_window_inner(xid, x, y, None)
+    }
+
+    /// Move and resize a managed window to an absolute screen rectangle.
+    pub fn move_resize_window(
+        &self,
+        xid: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<()> {
+        let width = width.max(1) as u32;
+        let height = height.max(1) as u32;
+        self.move_resize_window_inner(xid, x, y, Some((width, height)))
+    }
+
+    fn move_resize_window_inner(
+        &self,
+        xid: u32,
+        x: i32,
+        y: i32,
+        size: Option<(u32, u32)>,
+    ) -> Result<()> {
         const STATIC_GRAVITY: u32 = 10;
         const HAS_X: u32 = 1 << 8;
         const HAS_Y: u32 = 1 << 9;
+        const HAS_WIDTH: u32 = 1 << 10;
+        const HAS_HEIGHT: u32 = 1 << 11;
         const SOURCE_APPLICATION: u32 = 1 << 12;
 
-        let flags = STATIC_GRAVITY | HAS_X | HAS_Y | SOURCE_APPLICATION;
+        let mut flags = STATIC_GRAVITY | HAS_X | HAS_Y | SOURCE_APPLICATION;
+        let (width, height) = size.unwrap_or((0, 0));
+        if size.is_some() {
+            flags |= HAS_WIDTH | HAS_HEIGHT;
+        }
+
         let event = ClientMessageEvent::new(
             32,
             xid,
             self.atoms.net_moveresize_window,
-            [flags, x as u32, y as u32, 0, 0],
+            [flags, x as u32, y as u32, width, height],
         );
         let conn = &*self.conn;
         conn.send_event(
@@ -301,17 +340,28 @@ impl X11Helper {
 
         // Muffin can ignore direct ConfigureWindow requests sent to the GTK
         // client window after it has reparented the window into a WM frame.
-        // Move the outermost child of the root window as the synchronous
-        // fallback so pointer-dragging remains responsive on Cinnamon.
+        // Configure the outermost child of the root window as a synchronous
+        // fallback so locked companion windows stay visually attached.
         let target = self.outer_window(xid).unwrap_or(xid);
-        conn.configure_window(target, &ConfigureWindowAux::new().x(x).y(y))?;
+        let mut aux = ConfigureWindowAux::new().x(x).y(y);
+        if let Some((width, height)) = size {
+            aux = aux.width(width).height(height);
+        }
+        conn.configure_window(target, &aux)?;
         conn.flush()?;
         Ok(())
     }
 
     /// Current top-left client-window position in root coordinates.
     pub fn window_position(&self, xid: u32) -> Result<(i32, i32)> {
+        let geometry = self.window_geometry(xid)?;
+        Ok((geometry.x, geometry.y))
+    }
+
+    /// Current outer-frame geometry in root coordinates.
+    pub fn window_geometry(&self, xid: u32) -> Result<WindowGeometry> {
         let target = self.outer_window(xid).unwrap_or(xid);
+        let geometry = self.conn.get_geometry(target)?.reply()?;
         let reply = self
             .conn
             .translate_coordinates(target, self.root, 0, 0)?
@@ -321,7 +371,12 @@ impl X11Helper {
                 "window is not on the same X11 screen as the root window"
             ));
         }
-        Ok((reply.dst_x as i32, reply.dst_y as i32))
+        Ok(WindowGeometry {
+            x: reply.dst_x as i32,
+            y: reply.dst_y as i32,
+            width: geometry.width as i32,
+            height: geometry.height as i32,
+        })
     }
 
     /// Current pointer position in root coordinates.
@@ -337,7 +392,26 @@ impl X11Helper {
             .or_else(|_| self.root_monitor_geometry())
     }
 
+    /// Best-effort monitor geometry for a window.
+    /// Falls back to the primary/root monitor when RandR cannot resolve one.
+    pub fn monitor_geometry_for_window(&self, xid: u32) -> Result<MonitorGeometry> {
+        let geometry = self.window_geometry(xid)?;
+        self.randr_monitor_geometries()
+            .ok()
+            .and_then(|monitors| best_monitor_for_rect(&monitors, geometry))
+            .or_else(|| self.primary_monitor_geometry().ok())
+            .ok_or_else(|| anyhow!("no monitor geometry available"))
+    }
+
     fn randr_primary_monitor_geometry(&self) -> Result<MonitorGeometry> {
+        let monitors = self.randr_monitor_geometries()?;
+        if monitors.is_empty() {
+            return Err(anyhow!("RandR did not report an active monitor"));
+        }
+        Ok(monitors[0])
+    }
+
+    fn randr_monitor_geometries(&self) -> Result<Vec<MonitorGeometry>> {
         let conn = &*self.conn;
         let _ = conn.randr_query_version(1, 5)?.reply()?;
         let resources = conn
@@ -357,6 +431,7 @@ impl X11Helper {
                 .filter(|output| *output != primary),
         );
 
+        let mut monitors = Vec::new();
         for output in outputs {
             let output_info = conn
                 .randr_get_output_info(output, resources.config_timestamp)?
@@ -374,7 +449,7 @@ impl X11Helper {
                 continue;
             }
 
-            return Ok(MonitorGeometry {
+            monitors.push(MonitorGeometry {
                 x: crtc.x as i32,
                 y: crtc.y as i32,
                 width: crtc.width as i32,
@@ -382,7 +457,11 @@ impl X11Helper {
             });
         }
 
-        Err(anyhow!("RandR did not report an active monitor"))
+        if monitors.is_empty() {
+            Err(anyhow!("RandR did not report an active monitor"))
+        } else {
+            Ok(monitors)
+        }
     }
 
     fn root_monitor_geometry(&self) -> Result<MonitorGeometry> {
@@ -434,5 +513,66 @@ impl X11Helper {
             event,
         )?;
         Ok(())
+    }
+}
+
+fn best_monitor_for_rect(
+    monitors: &[MonitorGeometry],
+    rect: WindowGeometry,
+) -> Option<MonitorGeometry> {
+    let rect_center = (rect.x + rect.width / 2, rect.y + rect.height / 2);
+    monitors.iter().copied().max_by_key(|monitor| {
+        let contains_center = contains_point(*monitor, rect_center) as i64;
+        (
+            overlap_area(*monitor, rect),
+            contains_center,
+            monitor.width as i64 * monitor.height as i64,
+        )
+    })
+}
+
+fn contains_point(monitor: MonitorGeometry, point: (i32, i32)) -> bool {
+    point.0 >= monitor.x
+        && point.0 < monitor.x + monitor.width
+        && point.1 >= monitor.y
+        && point.1 < monitor.y + monitor.height
+}
+
+fn overlap_area(monitor: MonitorGeometry, rect: WindowGeometry) -> i64 {
+    let left = monitor.x.max(rect.x);
+    let top = monitor.y.max(rect.y);
+    let right = (monitor.x + monitor.width).min(rect.x + rect.width);
+    let bottom = (monitor.y + monitor.height).min(rect.y + rect.height);
+    i64::from((right - left).max(0)) * i64::from((bottom - top).max(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn best_monitor_for_rect_uses_window_screen() {
+        let monitors = [
+            MonitorGeometry {
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+            },
+            MonitorGeometry {
+                x: 1_920,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+            },
+        ];
+        let rect = WindowGeometry {
+            x: 1_950,
+            y: 284,
+            width: 742,
+            height: 842,
+        };
+
+        assert_eq!(best_monitor_for_rect(&monitors, rect), Some(monitors[1]));
     }
 }

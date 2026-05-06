@@ -19,6 +19,7 @@ use crate::utils::{
     font_description_from_parts, font_family_matches, parse_font_description, rgba_from_hex,
     rgba_to_hex, FONT_SIZE_OPTIONS, FONT_WEIGHT_OPTIONS,
 };
+use crate::widgets::full_lyrics_window::FullLyricsWindow;
 
 mod imp {
     use super::*;
@@ -40,6 +41,7 @@ mod imp {
         pub offset_spin: RefCell<Option<adw::SpinRow>>,
         pub manual_match_button: RefCell<Option<gtk::Button>>,
         pub manual_match_row: RefCell<Option<adw::ActionRow>>,
+        pub full_lyrics_window: RefCell<Option<FullLyricsWindow>>,
 
         pub last_track_uri: RefCell<String>,
         pub last_track_label: RefCell<String>,
@@ -62,6 +64,7 @@ mod imp {
                 offset_spin: RefCell::new(None),
                 manual_match_button: RefCell::new(None),
                 manual_match_row: RefCell::new(None),
+                full_lyrics_window: RefCell::new(None),
                 last_track_uri: RefCell::new(String::new()),
                 last_track_label: RefCell::new(String::new()),
                 last_auth: RefCell::new(None),
@@ -87,6 +90,9 @@ mod imp {
 
             // Hide instead of destroy so the tray can re-present us.
             obj.connect_close_request(|win| {
+                if let Some(full) = win.imp().full_lyrics_window.borrow().as_ref() {
+                    full.hide_locked();
+                }
                 win.set_visible(false);
                 glib::Propagation::Stop
             });
@@ -113,11 +119,17 @@ impl PreferencesWindow {
             .property("title", "Spot-Lyric")
             .property("default-width", 620)
             .property("default-height", 720)
+            .property("decorated", true)
+            .property("deletable", true)
             .build()
     }
 
     pub fn attach_bridge(&self, cmd_tx: mpsc::UnboundedSender<Command>) {
         *self.imp().cmd_tx.borrow_mut() = Some(cmd_tx);
+    }
+
+    pub fn attach_full_lyrics_window(&self, window: FullLyricsWindow) {
+        *self.imp().full_lyrics_window.borrow_mut() = Some(window);
     }
 
     fn send(&self, cmd: Command) {
@@ -780,6 +792,9 @@ impl PreferencesWindow {
             &track_uri,
             tx,
         );
+        if let Some(full) = self.imp().full_lyrics_window.borrow().as_ref() {
+            full.present_locked_beside(self);
+        }
         true
     }
 
@@ -948,6 +963,7 @@ pub fn install_ui_dispatcher(
     window: &PreferencesWindow,
     rx: std_mpsc::Receiver<crate::bridge::UiUpdate>,
     desktop: crate::widgets::desktop_lyrics_window::DesktopLyricsWindow,
+    full_lyrics: crate::widgets::full_lyrics_window::FullLyricsWindow,
     tray_state: std::sync::Arc<std::sync::Mutex<crate::tray::TrayState>>,
     tray_handle: Rc<std::cell::RefCell<Option<crate::tray::TrayHandle>>>,
 ) {
@@ -955,7 +971,7 @@ pub fn install_ui_dispatcher(
     let win_weak = window.downgrade();
     let rx = std::cell::RefCell::new(rx);
     glib::source::idle_add_local(
-        clone!(@strong desktop, @strong tray_state, @strong tray_handle => move || {
+        clone!(@strong desktop, @strong full_lyrics, @strong tray_state, @strong tray_handle => move || {
             // Drain quickly per idle tick.
             while let Ok(update) = rx.borrow_mut().try_recv() {
                 let Some(win) = win_weak.upgrade() else {
@@ -987,6 +1003,7 @@ pub fn install_ui_dispatcher(
                         let previous_track_uri = desktop.current_track_uri();
                         win.apply_playback(&state.track_uri, &state.track_name, &state.artist_name);
                         desktop.apply_playback(&state);
+                        full_lyrics.apply_playback(&state);
                         if let Some(track_uri) = lyrics_load_request_for_playback(
                             previous_track_uri.as_str(),
                             state.track_uri.as_str(),
@@ -1012,6 +1029,9 @@ pub fn install_ui_dispatcher(
                         if track_uri == desktop.current_track_uri() {
                             desktop.set_lyrics(&payload);
                         }
+                        if track_uri == full_lyrics.current_track_uri() {
+                            full_lyrics.set_lyrics(&payload);
+                        }
                     }
                     UiUpdate::LyricsLoadFailed { track_uri: _, error } => {
                         win.show_toast(&format!("歌词加载失败：{error}"));
@@ -1021,6 +1041,7 @@ pub fn install_ui_dispatcher(
                     }
                     UiUpdate::LyricsPreview(payload) => {
                         desktop.set_lyrics(&payload);
+                        full_lyrics.set_lyrics(&payload);
                     }
                     UiUpdate::LyricsMatchSaved { track_uri: _ } => {
                         win.show_toast("已保存匹配，正在重新加载歌词…");
