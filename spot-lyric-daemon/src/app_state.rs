@@ -18,6 +18,7 @@ use crate::{
     domain::{LyricsDomain, PlaybackDomain},
     error::Result,
     lyrics_external::{netease::NeteaseLyricsClient, qq::QqMusicLyricsClient},
+    playback_sources::mpris::MprisPlaybackSource,
     spotify::{
         auth_service::{AuthService, AuthServiceOptions},
         connect_state::ConnectStateClient,
@@ -25,8 +26,11 @@ use crate::{
         lyrics_api::LyricsClient,
         transport::SpotifyTransport,
     },
-    storage::{CookieStore, Database, DeviceStore, LyricsStore},
-    types::{AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackState},
+    storage::{CookieStore, Database, DeviceStore, LyricsStore, PlaybackStore},
+    types::{
+        AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackSettings,
+        PlaybackState,
+    },
 };
 
 #[derive(Debug)]
@@ -43,6 +47,8 @@ pub struct AppState {
     paths: Arc<AppPaths>,
     playback_domain: PlaybackDomain,
     playback_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    playback_settings_events: broadcast::Sender<PlaybackSettings>,
+    playback_store: PlaybackStore,
     settings_events: broadcast::Sender<LyricsSettings>,
     shutdown_events: broadcast::Sender<()>,
 }
@@ -55,6 +61,7 @@ impl AppState {
         let database = Database::open(&paths.sqlite_path).await?;
         let device_store = DeviceStore::new(database.clone());
         let cookie_store = CookieStore::new(database.clone());
+        let playback_store = PlaybackStore::new(database.clone());
         let lyrics_store = LyricsStore::new(database);
         let device_id = device_store.get_or_create_device_id().await?;
 
@@ -92,7 +99,11 @@ impl AppState {
         );
         let transport = SpotifyTransport::new(auth.clone(), http_client.clone(), protocol.clone());
         let connect = ConnectStateClient::new(transport.clone(), protocol.clone(), device_id);
-        let playback_domain = PlaybackDomain::new(connect);
+        let playback_domain = PlaybackDomain::new(
+            connect,
+            MprisPlaybackSource::new(),
+            playback_store.clone(),
+        );
         let spotify_lyrics = LyricsClient::new(transport, protocol);
         let lyrics_domain = LyricsDomain::new(
             playback_domain.clone(),
@@ -102,6 +113,7 @@ impl AppState {
             QqMusicLyricsClient::new(http_client),
         );
         let (settings_events, _) = broadcast::channel(64);
+        let (playback_settings_events, _) = broadcast::channel(64);
         let (shutdown_events, _) = broadcast::channel(8);
 
         let state = Self {
@@ -114,6 +126,8 @@ impl AppState {
             paths: Arc::new(paths),
             playback_domain,
             playback_task: Arc::new(Mutex::new(None)),
+            playback_settings_events,
+            playback_store,
             settings_events,
             shutdown_events,
         };
@@ -159,6 +173,10 @@ impl AppState {
         self.settings_events.subscribe()
     }
 
+    pub fn subscribe_playback_settings(&self) -> broadcast::Receiver<PlaybackSettings> {
+        self.playback_settings_events.subscribe()
+    }
+
     pub async fn auth_snapshot(&self) -> AuthSnapshot {
         self.auth.get_snapshot().await
     }
@@ -181,6 +199,10 @@ impl AppState {
 
     pub async fn playback_state(&self) -> PlaybackState {
         self.playback_domain.get_state().await
+    }
+
+    pub async fn playback_settings(&self) -> Result<PlaybackSettings> {
+        self.playback_store.get_settings().await
     }
 
     pub async fn toggle_playing(&self) -> Result<()> {
@@ -235,6 +257,15 @@ impl AppState {
     pub async fn set_timing_offset_ms(&self, offset_ms: i32) -> Result<LyricsSettings> {
         let settings = self.lyrics_domain.set_timing_offset_ms(offset_ms).await?;
         let _ = self.settings_events.send(settings.clone());
+        Ok(settings)
+    }
+
+    pub async fn set_preferred_playback_source(&self, source: &str) -> Result<PlaybackSettings> {
+        let settings = self.playback_store.set_preferred_playback_source(source).await?;
+        self.playback_domain
+            .set_preferred_playback_source(&settings.preferred_playback_source)
+            .await;
+        let _ = self.playback_settings_events.send(settings.clone());
         Ok(settings)
     }
 

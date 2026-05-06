@@ -40,7 +40,17 @@ fn default_status() -> String {
     "idle".to_string()
 }
 
+fn default_preferred_playback_source() -> String {
+    "auto".to_string()
+}
+
 // ─── Playback ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlaybackSettings {
+    #[serde(default = "default_preferred_playback_source")]
+    pub preferred_playback_source: String,
+}
 
 /// PlaybackState — must serialize as a D-Bus dict (`a{sv}`) to match the
 /// daemon's `cn.spotlyric.Playback.GetState` return / `StateChanged` signal.
@@ -57,6 +67,7 @@ pub struct PlaybackState {
     pub duration_ms: i64,
     pub volume: f64,
     pub player_status: String,
+    pub playback_source: String,
 }
 
 // ─── Lyrics ─────────────────────────────────────────────────────────────────

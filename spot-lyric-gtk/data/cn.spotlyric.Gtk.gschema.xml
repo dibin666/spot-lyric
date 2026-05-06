@@ -89,6 +89,17 @@
     </key>
 
     <!-- 歌词源（前端缓存；权威值在内置后端） -->
+    <key name="preferred-playback-source" type="s">
+      <choices>
+        <choice value="auto"/>
+        <choice value="mpris"/>
+        <choice value="dealer"/>
+        <choice value="connect-state"/>
+        <choice value="web-api"/>
+      </choices>
+      <default>'auto'</default>
+      <summary>Preferred playback source</summary>
+    </key>
     <key name="preferred-provider" type="s">
       <choices>
         <choice value="netease"/>

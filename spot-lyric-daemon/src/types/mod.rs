@@ -9,4 +9,4 @@ pub use lyrics::{
     LyricsCandidate, LyricsLine, LyricsPayload, LyricsSettings, LyricsWord, SavedLyricsMatch,
     StoredLyricsCandidate,
 };
-pub use playback::PlaybackState;
+pub use playback::{PlaybackSettings, PlaybackState};

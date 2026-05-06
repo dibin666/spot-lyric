@@ -1,7 +1,8 @@
 //! Updates pushed from the D-Bus worker thread back to the GTK main thread.
 
 use crate::dbus::types::{
-    AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackState,
+    AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackSettings,
+    PlaybackState,
 };
 
 #[derive(Debug, Clone)]
@@ -10,6 +11,7 @@ pub enum UiUpdate {
     Disconnected(String),
 
     PlaybackStateChanged(PlaybackState),
+    PlaybackSettingsLoaded(PlaybackSettings),
 
     LyricsLoaded {
         track_uri: String,

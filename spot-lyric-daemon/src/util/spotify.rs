@@ -3,6 +3,7 @@ use crate::types::ImageResource;
 const BASE62_CHARS: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const LOCAL_URI_PREFIX: &str = "spotify:local:";
 const TRACK_URI_PREFIX: &str = "spotify:track:";
+const SPOTIFY_MPRIS_TRACK_PATH_PREFIX: &str = "/com/spotify/track/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackIdentity {
@@ -34,10 +35,37 @@ pub fn hex_to_base62(hex: &str) -> Option<String> {
 }
 
 pub fn extract_track_id(value: &str) -> String {
-    value
-        .strip_prefix(TRACK_URI_PREFIX)
-        .unwrap_or(value)
-        .to_string()
+    let value = value.trim();
+    if let Some(track_id) = value.strip_prefix(TRACK_URI_PREFIX) {
+        return track_id.to_string();
+    }
+    if let Some(track_id) = value.strip_prefix(SPOTIFY_MPRIS_TRACK_PATH_PREFIX) {
+        return track_id.to_string();
+    }
+    if let Ok(url) = url::Url::parse(value) {
+        if let Some(track_id) = spotify_track_id_from_url(&url) {
+            return track_id;
+        }
+    }
+    value.to_string()
+}
+
+fn spotify_track_id_from_url(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?.trim();
+    if !host.eq_ignore_ascii_case("open.spotify.com")
+        && !host.eq_ignore_ascii_case("play.spotify.com")
+    {
+        return None;
+    }
+
+    let segments: Vec<_> = url.path_segments()?.collect();
+    let track_index = segments.iter().position(|segment| *segment == "track")?;
+    let track_id = segments.get(track_index + 1)?.trim();
+    if track_id.is_empty() {
+        None
+    } else {
+        Some(track_id.to_string())
+    }
 }
 
 pub fn is_local_track_uri(value: Option<&str>) -> bool {
@@ -104,4 +132,45 @@ pub fn sort_images_by_quality(mut images: Vec<ImageResource>) -> Vec<ImageResour
             .then_with(|| right.url.cmp(&left.url))
     });
     images
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_track_id_from_spotify_uri() {
+        assert_eq!(
+            extract_track_id("spotify:track:4uLU6hMCjMI75M1A2tKUQC"),
+            "4uLU6hMCjMI75M1A2tKUQC"
+        );
+    }
+
+    #[test]
+    fn extracts_track_id_from_open_spotify_url() {
+        assert_eq!(
+            extract_track_id("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC?si=test"),
+            "4uLU6hMCjMI75M1A2tKUQC"
+        );
+    }
+
+    #[test]
+    fn extracts_track_id_from_mpris_track_path() {
+        assert_eq!(
+            extract_track_id("/com/spotify/track/4uLU6hMCjMI75M1A2tKUQC"),
+            "4uLU6hMCjMI75M1A2tKUQC"
+        );
+    }
+
+    #[test]
+    fn resolves_identity_from_open_spotify_url() {
+        let identity = resolve_track_identity(
+            None,
+            Some("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC?si=test"),
+            None,
+        );
+
+        assert_eq!(identity.id.as_deref(), Some("4uLU6hMCjMI75M1A2tKUQC"));
+        assert_eq!(identity.hex_id, to_hex_track_id("4uLU6hMCjMI75M1A2tKUQC"));
+    }
 }

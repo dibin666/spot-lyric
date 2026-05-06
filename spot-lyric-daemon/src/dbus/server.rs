@@ -43,6 +43,7 @@ pub async fn serve_dbus(state: AppState) -> Result<DbusRuntime> {
     let tasks = vec![
         spawn_auth_signal_pump(connection.clone(), state.clone()),
         spawn_playback_signal_pump(connection.clone(), state.clone()),
+        spawn_playback_settings_signal_pump(connection.clone(), state.clone()),
         spawn_lyrics_signal_pump(connection.clone(), state.clone()),
         spawn_name_watchdog(connection.clone(), state),
     ];
@@ -83,6 +84,28 @@ fn spawn_playback_signal_pump(connection: zbus::Connection, state: AppState) -> 
                     if let Ok(iface_ref) = connection.object_server().interface::<_, PlaybackIface>(DBUS_OBJECT_PATH).await {
                         let emitter = iface_ref.signal_emitter();
                         let _ = PlaybackIface::state_changed(&emitter, &playback).await;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn spawn_playback_settings_signal_pump(
+    connection: zbus::Connection,
+    state: AppState,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut receiver = state.subscribe_playback_settings();
+        loop {
+            tokio::select! {
+                _ = state.wait_for_shutdown() => break,
+                result = receiver.recv() => {
+                    let Ok(settings) = result else { continue; };
+                    let Ok(payload) = to_json_reply(&settings) else { continue; };
+                    if let Ok(iface_ref) = connection.object_server().interface::<_, PlaybackIface>(DBUS_OBJECT_PATH).await {
+                        let emitter = iface_ref.signal_emitter();
+                        let _ = PlaybackIface::settings_changed(&emitter, &payload).await;
                     }
                 }
             }

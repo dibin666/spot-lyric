@@ -40,12 +40,17 @@ pub mod playback {
     )]
     pub trait SpotLyricPlayback {
         async fn get_state(&self) -> zbus::Result<PlaybackState>;
+        async fn get_settings(&self) -> zbus::Result<String>;
+        async fn set_preferred_playback_source(&self, source: &str) -> zbus::Result<()>;
         async fn toggle_playing(&self) -> zbus::Result<()>;
         async fn skip_next(&self) -> zbus::Result<()>;
         async fn skip_previous(&self) -> zbus::Result<()>;
 
         #[zbus(signal)]
         async fn state_changed(&self, state: PlaybackState) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        async fn settings_changed(&self, settings: &str) -> zbus::Result<()>;
     }
 }
 

@@ -9,6 +9,8 @@ pub enum Command {
     TogglePlaying,
     SkipNext,
     SkipPrevious,
+    SetPreferredPlaybackSource(String),
+    LoadPlaybackSettings,
 
     // ── Lyrics
     LoadLyrics {

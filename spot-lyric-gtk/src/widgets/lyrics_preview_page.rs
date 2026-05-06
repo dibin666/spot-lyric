@@ -28,6 +28,8 @@ struct LyricsPreviewPageInner {
     active_index: Cell<Option<usize>>,
     current_track_uri: RefCell<String>,
     current_track_label: RefCell<String>,
+    lyrics_summary: RefCell<String>,
+    playback_state: RefCell<PlaybackState>,
     clock: CellClock,
     clock_tick_id: Cell<Option<glib::SourceId>>,
 }
@@ -64,6 +66,7 @@ impl LyricsPreviewPage {
             self.inner
                 .clock
                 .snapshot(state.position_ms, state.duration_ms, state.is_playing);
+        *self.inner.playback_state.borrow_mut() = state.clone();
         tracing::debug!(
             target: "spot_lyric_gtk::timeline",
             surface = "preview",
@@ -73,6 +76,7 @@ impl LyricsPreviewPage {
             track_uri = %state.track_uri,
             "playback snapshot applied"
         );
+        self.refresh_subtitle(position_ms);
         self.update_empty_label();
         self.update_active_line(position_ms);
     }
@@ -81,7 +85,7 @@ impl LyricsPreviewPage {
         *self.inner.lyrics.borrow_mut() = payload.lines.clone();
         self.inner.active_index.set(None);
         self.rebuild_rows();
-        self.update_payload_subtitle(payload);
+        self.update_payload_summary(payload);
         self.update_active_line(self.inner.clock.estimate());
     }
 
@@ -96,7 +100,9 @@ impl LyricsPreviewPage {
                 return glib::ControlFlow::Break;
             };
             let page = LyricsPreviewPage { inner };
-            page.update_active_line(page.inner.clock.estimate());
+            let position_ms = page.inner.clock.estimate();
+            page.update_active_line(position_ms);
+            page.refresh_subtitle(position_ms);
             glib::ControlFlow::Continue
         });
         self.inner.clock_tick_id.set(Some(id));
@@ -204,7 +210,7 @@ impl LyricsPreviewPage {
         }
     }
 
-    fn update_payload_subtitle(&self, payload: &LyricsPayload) {
+    fn update_payload_summary(&self, payload: &LyricsPayload) {
         let provider = payload.provider.as_deref().unwrap_or_default();
         let sync_type = payload.sync_type.as_str();
         let subtitle = match (provider.is_empty(), sync_type.is_empty()) {
@@ -212,6 +218,22 @@ impl LyricsPreviewPage {
             (false, true) => format!("{provider} · {} 行", payload.lines.len()),
             (true, false) => format!("{sync_type} · {} 行", payload.lines.len()),
             (true, true) => format!("{} 行歌词", payload.lines.len()),
+        };
+        *self.inner.lyrics_summary.borrow_mut() = subtitle;
+        self.refresh_subtitle(self.inner.clock.estimate());
+    }
+
+    fn refresh_subtitle(&self, position_ms: i64) {
+        let playback_summary = playback_summary(&self.inner.playback_state.borrow(), position_ms);
+        let lyrics_summary = self.inner.lyrics_summary.borrow().clone();
+        let subtitle = match (
+            playback_summary.trim().is_empty(),
+            lyrics_summary.trim().is_empty(),
+        ) {
+            (false, false) => format!("{playback_summary} | 歌词：{lyrics_summary}"),
+            (false, true) => playback_summary,
+            (true, false) => lyrics_summary,
+            (true, true) => "播放歌曲后显示完整歌词".to_string(),
         };
         self.inner.subtitle_label.set_text(&subtitle);
     }
@@ -284,6 +306,8 @@ fn build_inner() -> LyricsPreviewPageInner {
         active_index: Cell::new(None),
         current_track_uri: RefCell::new(String::new()),
         current_track_label: RefCell::new(String::new()),
+        lyrics_summary: RefCell::new(String::new()),
+        playback_state: RefCell::new(PlaybackState::default()),
         clock: CellClock::new(),
         clock_tick_id: Cell::new(None),
     }
@@ -383,6 +407,56 @@ fn track_label(state: &PlaybackState) -> String {
         state.track_name.clone()
     } else {
         format!("{} — {}", state.track_name, state.artist_name)
+    }
+}
+
+fn playback_summary(state: &PlaybackState, position_ms: i64) -> String {
+    let source = playback_source_label(state.playback_source.as_str());
+    let status = if state.player_status == "error" {
+        "错误"
+    } else if state.is_playing {
+        "播放中"
+    } else if state.track_uri.is_empty() {
+        "空闲"
+    } else {
+        "已暂停"
+    };
+
+    let progress = if state.duration_ms > 0 {
+        format!(
+            "{} / {}",
+            format_clock(position_ms),
+            format_clock(state.duration_ms)
+        )
+    } else {
+        format_clock(position_ms)
+    };
+
+    format!("播放：{source} · {status} · {progress}")
+}
+
+fn playback_source_label(source: &str) -> &'static str {
+    match source {
+        "mpris" => "MPRIS",
+        "dealer" => "Dealer WebSocket",
+        "connect-state" => "Connect State",
+        "web-api" => "Web API",
+        "web-api-cache" => "Web API Cache",
+        "error" => "错误",
+        "idle" => "空闲",
+        _ => "自动",
+    }
+}
+
+fn format_clock(total_ms: i64) -> String {
+    let total_seconds = total_ms.max(0) / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
     }
 }
 

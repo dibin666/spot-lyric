@@ -7,13 +7,12 @@ use std::sync::mpsc as std_mpsc;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib::clone;
-use gtk::prelude::*;
 use gtk::{gio, glib};
 use tokio::sync::mpsc;
 
 use crate::bridge::Command;
 use crate::config;
-use crate::dbus::types::{AuthSnapshot, LyricsSettings};
+use crate::dbus::types::{AuthSnapshot, LyricsSettings, PlaybackSettings, PlaybackState};
 use crate::dialogs::{auth_dialog, lyrics_match_dialog};
 use crate::utils::{
     font_description_from_parts, font_family_matches, parse_font_description, rgba_from_hex,
@@ -37,6 +36,8 @@ mod imp {
         pub profile_combo: RefCell<Option<adw::ComboRow>>,
 
         // Lyrics
+        pub playback_source_combo: RefCell<Option<adw::ComboRow>>,
+        pub active_playback_source_row: RefCell<Option<adw::ActionRow>>,
         pub provider_combo: RefCell<Option<adw::ComboRow>>,
         pub offset_spin: RefCell<Option<adw::SpinRow>>,
         pub manual_match_button: RefCell<Option<gtk::Button>>,
@@ -48,6 +49,7 @@ mod imp {
         pub last_track_search_query: RefCell<String>,
         pub last_auth: RefCell<Option<AuthSnapshot>>,
         pub last_settings: RefCell<Option<LyricsSettings>>,
+        pub last_playback_settings: RefCell<Option<PlaybackSettings>>,
         pub suppress_signals: Cell<bool>,
     }
 
@@ -61,6 +63,8 @@ mod imp {
                 account_status_row: RefCell::new(None),
                 account_status_dot: RefCell::new(None),
                 profile_combo: RefCell::new(None),
+                playback_source_combo: RefCell::new(None),
+                active_playback_source_row: RefCell::new(None),
                 provider_combo: RefCell::new(None),
                 offset_spin: RefCell::new(None),
                 manual_match_button: RefCell::new(None),
@@ -71,6 +75,7 @@ mod imp {
                 last_track_search_query: RefCell::new(String::new()),
                 last_auth: RefCell::new(None),
                 last_settings: RefCell::new(None),
+                last_playback_settings: RefCell::new(None),
                 suppress_signals: Cell::new(false),
             }
         }
@@ -155,6 +160,7 @@ impl PreferencesWindow {
         // We keep the banner separate by putting it inside a wrapper page.
 
         self.add(&self.build_account_page());
+        self.add(&self.build_playback_page(&settings));
         self.add(&self.build_lyrics_page(&settings));
         let lyrics_preview = LyricsPreviewPage::new();
         self.add(&lyrics_preview.widget());
@@ -273,6 +279,61 @@ impl PreferencesWindow {
         let imp = self.imp();
         *imp.account_status_row.borrow_mut() = Some(status_row);
         *imp.account_status_dot.borrow_mut() = Some(dot);
+
+        page
+    }
+
+    fn build_playback_page(&self, settings: &gio::Settings) -> adw::PreferencesPage {
+        let page = adw::PreferencesPage::builder()
+            .title("播放")
+            .icon_name("media-playback-start-symbolic")
+            .build();
+
+        let group = adw::PreferencesGroup::builder()
+            .title("播放进度来源")
+            .description("仅选择最高优先级，其余来源按照默认回退顺序继续尝试")
+            .build();
+
+        let model = gtk::StringList::new(&[
+            "自动 (MPRIS > Dealer > Connect State > Web API)",
+            "MPRIS",
+            "Dealer WebSocket",
+            "Connect State",
+            "Web API",
+        ]);
+        let source_combo = adw::ComboRow::builder()
+            .title("优先播放来源")
+            .subtitle("Free 账户建议保持自动或优先 MPRIS")
+            .model(&model)
+            .build();
+        source_combo.set_selected(playback_source_combo_index(
+            settings.string("preferred-playback-source").as_str(),
+        ));
+        let weak = self.downgrade();
+        source_combo.connect_selected_notify(move |row| {
+            let Some(win) = weak.upgrade() else { return };
+            if win.imp().suppress_signals.get() {
+                return;
+            }
+            let value = playback_source_value(row.selected());
+            if let Some(settings) = win.imp().gsettings.borrow().as_ref() {
+                let _ = settings.set_string("preferred-playback-source", value);
+            }
+            win.send(Command::SetPreferredPlaybackSource(value.into()));
+        });
+        group.add(&source_combo);
+
+        let active_source_row = adw::ActionRow::builder()
+            .title("当前实际来源")
+            .subtitle("等待播放信息…")
+            .build();
+        group.add(&active_source_row);
+
+        page.add(&group);
+
+        let imp = self.imp();
+        *imp.playback_source_combo.borrow_mut() = Some(source_combo);
+        *imp.active_playback_source_row.borrow_mut() = Some(active_source_row);
 
         page
     }
@@ -775,6 +836,25 @@ impl PreferencesWindow {
         imp.suppress_signals.set(false);
     }
 
+    pub fn apply_playback_settings(&self, settings: &PlaybackSettings) {
+        let imp = self.imp();
+        *imp.last_playback_settings.borrow_mut() = Some(settings.clone());
+
+        imp.suppress_signals.set(true);
+        if let Some(combo) = imp.playback_source_combo.borrow().as_ref() {
+            combo.set_selected(playback_source_combo_index(
+                settings.preferred_playback_source.as_str(),
+            ));
+        }
+        if let Some(gsettings) = imp.gsettings.borrow().as_ref() {
+            let _ = gsettings.set_string(
+                "preferred-playback-source",
+                settings.preferred_playback_source.as_str(),
+            );
+        }
+        imp.suppress_signals.set(false);
+    }
+
     pub fn open_manual_match_dialog(&self) -> bool {
         let track_uri = self.imp().last_track_uri.borrow().clone();
         if !manual_match_available(track_uri.as_str()) {
@@ -815,6 +895,18 @@ impl PreferencesWindow {
         }
         if let Some(row) = imp.manual_match_row.borrow().as_ref() {
             row.set_sensitive(available);
+        }
+    }
+
+    pub fn apply_playback_state(&self, state: &PlaybackState) {
+        self.apply_playback(
+            state.track_uri.as_str(),
+            state.track_name.as_str(),
+            state.artist_name.as_str(),
+        );
+
+        if let Some(row) = self.imp().active_playback_source_row.borrow().as_ref() {
+            row.set_subtitle(&playback_state_summary(state));
         }
     }
 
@@ -980,6 +1072,7 @@ pub fn install_ui_dispatcher(
                         win.set_connected(true);
                         win.show_toast("已连接到 daemon");
                         win.send(Command::LoadAuthSnapshot);
+                        win.send(Command::LoadPlaybackSettings);
                         win.send(Command::LoadLyricsSettings);
                         tray_state.lock().unwrap().connected = true;
                         if let Some(handle) = tray_handle.borrow().as_ref() {
@@ -999,7 +1092,7 @@ pub fn install_ui_dispatcher(
                     }
                     UiUpdate::PlaybackStateChanged(state) => {
                         let previous_track_uri = desktop.current_track_uri();
-                        win.apply_playback(&state.track_uri, &state.track_name, &state.artist_name);
+                        win.apply_playback_state(&state);
                         desktop.apply_playback(&state);
                         if let Some(preview) = win.imp().lyrics_preview.borrow().as_ref() {
                             preview.apply_playback(&state);
@@ -1024,6 +1117,9 @@ pub fn install_ui_dispatcher(
                         if let Some(handle) = tray_handle.borrow().as_ref() {
                             handle.refresh();
                         }
+                    }
+                    UiUpdate::PlaybackSettingsLoaded(settings) => {
+                        win.apply_playback_settings(&settings);
                     }
                     UiUpdate::LyricsLoaded { track_uri, payload } => {
                         if track_uri == desktop.current_track_uri() {
@@ -1106,6 +1202,60 @@ fn manual_match_search_query(track_name: &str, artist_name: &str) -> String {
     } else {
         format!("{track_name} {artist_name}")
     }
+}
+
+fn playback_source_combo_index(source: &str) -> u32 {
+    match source.trim() {
+        "mpris" => 1,
+        "dealer" => 2,
+        "connect-state" => 3,
+        "web-api" => 4,
+        _ => 0,
+    }
+}
+
+fn playback_source_value(index: u32) -> &'static str {
+    match index {
+        1 => "mpris",
+        2 => "dealer",
+        3 => "connect-state",
+        4 => "web-api",
+        _ => "auto",
+    }
+}
+
+fn playback_source_label(source: &str) -> &'static str {
+    match source {
+        "mpris" => "MPRIS",
+        "dealer" => "Dealer WebSocket",
+        "connect-state" => "Connect State",
+        "web-api" => "Web API",
+        "web-api-cache" => "Web API Cache",
+        "error" => "错误",
+        "idle" => "空闲",
+        _ => "自动",
+    }
+}
+
+fn playback_state_summary(state: &PlaybackState) -> String {
+    let source = playback_source_label(state.playback_source.as_str());
+    let status = if state.player_status == "error" {
+        "错误"
+    } else if state.is_playing {
+        "播放中"
+    } else if state.track_uri.is_empty() {
+        "空闲"
+    } else {
+        "已暂停"
+    };
+    let track = if state.track_name.is_empty() {
+        "暂无歌曲".to_string()
+    } else if state.artist_name.is_empty() {
+        state.track_name.clone()
+    } else {
+        format!("{} — {}", state.track_name, state.artist_name)
+    };
+    format!("{source} · {status} · {track}")
 }
 
 #[cfg(test)]

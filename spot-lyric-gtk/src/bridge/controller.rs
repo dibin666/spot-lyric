@@ -14,7 +14,8 @@ use crate::backend_runtime::BackendRuntime;
 use crate::config;
 use crate::dbus::client::DaemonClient;
 use crate::dbus::types::{
-    AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackState,
+    AuthSnapshot, LyricsCandidate, LyricsPayload, LyricsSettings, PlaybackSettings,
+    PlaybackState,
 };
 
 /// Public handle returned to the GTK side.
@@ -91,6 +92,7 @@ async fn run_bridge(
                 // Spawn signal listeners (they hold weak refs to the client)
                 spawn_auth_signal(client.clone(), ui_tx.clone());
                 spawn_playback_signal(client.clone(), ui_tx.clone());
+                spawn_playback_settings_signal(client.clone(), ui_tx.clone());
                 spawn_lyrics_signal(client.clone(), ui_tx.clone());
 
                 // Push initial snapshots to the UI
@@ -154,6 +156,13 @@ async fn run_command_loop(
             Command::TogglePlaying => zbus_call(client.playback.toggle_playing(), ui_tx).await,
             Command::SkipNext => zbus_call(client.playback.skip_next(), ui_tx).await,
             Command::SkipPrevious => zbus_call(client.playback.skip_previous(), ui_tx).await,
+            Command::SetPreferredPlaybackSource(source) => {
+                match client.playback.set_preferred_playback_source(&source).await {
+                    Ok(_) => debug!("preferred playback source set to {source}"),
+                    Err(error) => report_error(ui_tx, error.to_string()),
+                }
+            }
+            Command::LoadPlaybackSettings => load_playback_settings(client, ui_tx).await,
 
             Command::LoadLyrics { track_uri } => {
                 *holdings.last_loaded_uri.write().await = Some(track_uri.clone());
@@ -240,6 +249,27 @@ fn spawn_playback_signal(client: DaemonClient, ui_tx: UiSender) {
     });
 }
 
+fn spawn_playback_settings_signal(client: DaemonClient, ui_tx: UiSender) {
+    tokio::spawn(async move {
+        match client.playback.receive_settings_changed().await {
+            Ok(mut stream) => {
+                while let Some(signal) = stream.next().await {
+                    match signal.args() {
+                        Ok(args) => match serde_json::from_str::<PlaybackSettings>(args.settings) {
+                            Ok(settings) => {
+                                let _ = ui_tx.send(UiUpdate::PlaybackSettingsLoaded(settings));
+                            }
+                            Err(error) => warn!("Playback settings parse failed: {error}"),
+                        },
+                        Err(error) => warn!("Playback settings signal arg error: {error}"),
+                    }
+                }
+            }
+            Err(error) => error!("Playback settings signal subscribe failed: {error}"),
+        }
+    });
+}
+
 fn spawn_lyrics_signal(client: DaemonClient, ui_tx: UiSender) {
     tokio::spawn(async move {
         match client.lyrics.receive_settings_changed().await {
@@ -273,6 +303,7 @@ async fn fetch_initial_state(client: &DaemonClient, ui_tx: &UiSender) {
         Err(error) => warn!("Initial playback state: {error}"),
     }
 
+    load_playback_settings(client, ui_tx).await;
     load_lyrics_settings(client, ui_tx).await;
 }
 
@@ -382,6 +413,18 @@ async fn load_lyrics_settings(client: &DaemonClient, ui_tx: &UiSender) {
                 let _ = ui_tx.send(UiUpdate::LyricsSettingsLoaded(settings));
             }
             Err(error) => report_error(ui_tx, format!("parse lyrics settings: {error}")),
+        },
+        Err(error) => report_error(ui_tx, error.to_string()),
+    }
+}
+
+async fn load_playback_settings(client: &DaemonClient, ui_tx: &UiSender) {
+    match client.playback.get_settings().await {
+        Ok(json) => match serde_json::from_str::<PlaybackSettings>(&json) {
+            Ok(settings) => {
+                let _ = ui_tx.send(UiUpdate::PlaybackSettingsLoaded(settings));
+            }
+            Err(error) => report_error(ui_tx, format!("parse playback settings: {error}")),
         },
         Err(error) => report_error(ui_tx, error.to_string()),
     }

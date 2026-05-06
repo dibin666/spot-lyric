@@ -4,12 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::{Digest as _, Sha1};
-use tokio::time::timeout;
+use tokio::{sync::RwLock, task::JoinHandle, time::timeout};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message as WebSocketMessage, MaybeTlsStream,
     WebSocketStream,
@@ -17,7 +17,13 @@ use tokio_tungstenite::{
 
 use crate::{
     error::{DaemonError, Result},
-    types::{Artist, ImageResource, PlaybackState, TrackInfo},
+    types::{
+        playback::{
+            PLAYBACK_SOURCE_CONNECT_STATE, PLAYBACK_SOURCE_DEALER, PLAYBACK_SOURCE_WEB_API,
+            PLAYBACK_SOURCE_WEB_API_CACHE,
+        },
+        Artist, ImageResource, PlaybackState, TrackInfo,
+    },
     util::spotify::{extract_track_id, hex_to_base62, is_hex_track_id, to_hex_track_id},
 };
 
@@ -34,6 +40,8 @@ const MAX_FRESH_TIMESTAMP_AGE: Duration = Duration::from_secs(3);
 const WEB_PLAYER_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 const CONNECT_STATE_ERROR_BACKOFF: Duration = Duration::from_secs(60);
 const DEALER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const DEALER_PING_INTERVAL: Duration = Duration::from_secs(30);
+const DEALER_SNAPSHOT_TTL: Duration = Duration::from_secs(5);
 const SPOTIFY_WEB_CLIENT_VERSION: &str = "harmony:4.72.0-a9118221e";
 const TRACK_PLAYBACK_DEVICE_NAME: &str = "Spot-Lyric";
 const TRACK_PLAYBACK_PLATFORM_IDENTIFIER: &str =
@@ -88,6 +96,7 @@ impl PlaybackFallbackState {
     fn cached_web_player_snapshot(&self, now: Instant) -> Option<ConnectPlaybackSnapshot> {
         let cached = self.last_web_player_snapshot.as_ref()?;
         let mut snapshot = cached.snapshot.clone();
+        snapshot.state.playback_source = PLAYBACK_SOURCE_WEB_API_CACHE.into();
         if snapshot.state.is_playing {
             let elapsed = now.saturating_duration_since(cached.observed_at);
             let elapsed_ms = elapsed
@@ -109,9 +118,15 @@ impl PlaybackFallbackState {
 
 #[derive(Debug)]
 struct ConnectSession {
-    _dealer_socket: DealerWebSocket,
+    _dealer_task: JoinHandle<()>,
     connection_id: String,
     observer_device_id: String,
+}
+
+impl Drop for ConnectSession {
+    fn drop(&mut self) {
+        self._dealer_task.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -119,6 +134,7 @@ pub struct ConnectStateClient {
     device_id: String,
     protocol: ProtocolRegistry,
     transport: SpotifyTransport,
+    dealer_snapshot: Arc<RwLock<Option<CachedPlaybackSnapshot>>>,
     fallback: Arc<tokio::sync::Mutex<PlaybackFallbackState>>,
     session: Arc<tokio::sync::Mutex<Option<ConnectSession>>>,
 }
@@ -129,6 +145,7 @@ impl ConnectStateClient {
             device_id,
             protocol,
             transport,
+            dealer_snapshot: Arc::new(RwLock::new(None)),
             fallback: Arc::new(tokio::sync::Mutex::new(PlaybackFallbackState::default())),
             session: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -148,6 +165,30 @@ impl ConnectStateClient {
                 self.fetch_web_player_state().await
             }
         }
+    }
+
+    pub async fn fetch_source(&self, source: &str) -> Result<Option<ConnectPlaybackSnapshot>> {
+        match source {
+            PLAYBACK_SOURCE_DEALER => self.fetch_dealer_state().await,
+            PLAYBACK_SOURCE_CONNECT_STATE => self.fetch_connect_state().await,
+            PLAYBACK_SOURCE_WEB_API => self.fetch_web_player_state().await,
+            _ => Ok(None),
+        }
+    }
+
+    async fn fetch_dealer_state(&self) -> Result<Option<ConnectPlaybackSnapshot>> {
+        self.ensure_session().await?;
+        let now = Instant::now();
+        let snapshot = self.dealer_snapshot.read().await.clone();
+        let Some(cached) = snapshot else {
+            return Ok(None);
+        };
+        if now.saturating_duration_since(cached.observed_at) > DEALER_SNAPSHOT_TTL {
+            return Ok(None);
+        }
+        let mut snapshot = cached.snapshot;
+        snapshot.state.playback_source = PLAYBACK_SOURCE_DEALER.into();
+        Ok(Some(snapshot))
     }
 
     async fn fetch_connect_state(&self) -> Result<Option<ConnectPlaybackSnapshot>> {
@@ -185,10 +226,19 @@ impl ConnectStateClient {
     }
 
     async fn ensure_session(&self) -> Result<()> {
+        {
+            let session = self.session.lock().await;
+            if session.is_some() {
+                return Ok(());
+            }
+        }
+
+        let established = self.establish_session().await?;
         let mut session = self.session.lock().await;
         if session.is_none() {
-            *session = Some(self.establish_session().await?);
+            *session = Some(established);
         }
+
         Ok(())
     }
 
@@ -202,9 +252,10 @@ impl ConnectStateClient {
         let state_seq_num = registration.initial_seq_num.saturating_add(1);
         self.push_track_playback_state(&playback_device_id, state_seq_num)
             .await?;
+        let dealer_task = spawn_dealer_reader(dealer_socket, self.dealer_snapshot.clone());
 
         Ok(ConnectSession {
-            _dealer_socket: dealer_socket,
+            _dealer_task: dealer_task,
             connection_id,
             observer_device_id,
         })
@@ -573,6 +624,108 @@ fn dealer_connection_id_from_event(event: &Value) -> Option<String> {
         })
 }
 
+fn spawn_dealer_reader(
+    mut socket: DealerWebSocket,
+    dealer_snapshot: Arc<RwLock<Option<CachedPlaybackSnapshot>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ping_interval = tokio::time::interval(DEALER_PING_INTERVAL);
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if let Err(error) = socket.send(WebSocketMessage::Ping(Vec::new().into())).await {
+                        tracing::debug!(%error, "dealer websocket ping failed");
+                        break;
+                    }
+                }
+                frame = socket.next() => {
+                    let Some(frame) = frame else {
+                        break;
+                    };
+
+                    match frame {
+                        Ok(WebSocketMessage::Ping(payload)) => {
+                            if let Err(error) = socket.send(WebSocketMessage::Pong(payload)).await {
+                                tracing::debug!(%error, "dealer websocket pong failed");
+                                break;
+                            }
+                        }
+                        Ok(WebSocketMessage::Text(text)) => {
+                            update_dealer_snapshot(text.as_ref(), &dealer_snapshot).await;
+                        }
+                        Ok(WebSocketMessage::Binary(bytes)) => {
+                            match std::str::from_utf8(bytes.as_ref()) {
+                                Ok(text) => update_dealer_snapshot(text, &dealer_snapshot).await,
+                                Err(error) => tracing::debug!(%error, "dealer websocket sent non-utf8 binary frame"),
+                            }
+                        }
+                        Ok(WebSocketMessage::Close(_)) => break,
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::debug!(%error, "dealer websocket read failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn update_dealer_snapshot(
+    text: &str,
+    dealer_snapshot: &Arc<RwLock<Option<CachedPlaybackSnapshot>>>,
+) {
+    match dealer_snapshot_from_text(text) {
+        Ok(Some(snapshot)) => {
+            *dealer_snapshot.write().await = Some(CachedPlaybackSnapshot {
+                snapshot,
+                observed_at: Instant::now(),
+            });
+        }
+        Ok(None) => {}
+        Err(error) => tracing::debug!(%error, "failed to decode dealer connect-state push"),
+    }
+}
+
+fn dealer_snapshot_from_text(text: &str) -> Result<Option<ConnectPlaybackSnapshot>> {
+    let event: Value = serde_json::from_str(text)?;
+    for candidate in dealer_payload_candidates(&event) {
+        if let Some(snapshot) = map_connect_state_response(candidate) {
+            return Ok(Some(snapshot));
+        }
+    }
+    Ok(None)
+}
+
+fn dealer_payload_candidates<'a>(event: &'a Value) -> Vec<&'a Value> {
+    let mut candidates = vec![event];
+
+    if let Some(payloads) = event.get("payloads").and_then(Value::as_array) {
+        for payload in payloads {
+            candidates.push(payload);
+            for path in [
+                "/cluster",
+                "/body",
+                "/body/cluster",
+                "/update",
+                "/update/cluster",
+                "/message",
+                "/message/body",
+                "/message/body/cluster",
+            ] {
+                if let Some(value) = payload.pointer(path) {
+                    candidates.push(value);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
 pub(crate) fn map_connect_state_response(raw: &Value) -> Option<ConnectPlaybackSnapshot> {
     let player = raw
         .get("player_state")
@@ -631,6 +784,7 @@ pub(crate) fn map_connect_state_response(raw: &Value) -> Option<ConnectPlaybackS
         duration_ms,
         volume,
         player_status: "ready".into(),
+        playback_source: PLAYBACK_SOURCE_CONNECT_STATE.into(),
     };
 
     Some(ConnectPlaybackSnapshot {
@@ -699,6 +853,7 @@ pub(crate) fn map_web_player_response(raw: &Value) -> Option<ConnectPlaybackSnap
         duration_ms,
         volume,
         player_status: "ready".into(),
+        playback_source: PLAYBACK_SOURCE_WEB_API.into(),
     };
 
     Some(ConnectPlaybackSnapshot {
@@ -1270,6 +1425,7 @@ mod tests {
                         duration_ms: 120_000,
                         volume: 1.0,
                         player_status: "ready".into(),
+                        playback_source: PLAYBACK_SOURCE_WEB_API.into(),
                     },
                     track: None,
                     active_device_id: None,
