@@ -28,7 +28,7 @@ use super::{
 
 const PLAYER_API_BASE: &str = "https://api.spotify.com/v1/me/player";
 const CURRENTLY_PLAYING_API: &str = "https://api.spotify.com/v1/me/player/currently-playing";
-const WEB_PLAYER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
+const WEB_PLAYER_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CACHED_PLAYING_EXTRAPOLATION: Duration = Duration::from_secs(3);
 const MAX_TIMESTAMP_POSITION_EXTRAPOLATION: Duration = Duration::from_secs(3);
 const WEB_PLAYER_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);

@@ -67,6 +67,13 @@ impl LyricsDomain {
         }
 
         if let Some(track) = self.playback.current_track_for_uri(track_uri).await {
+            let spotify_payload = self
+                .spotify_or_unmatched(Some(track_uri), Some(track.id.as_str()))
+                .await?;
+            if is_usable_spotify_lyrics(&spotify_payload) {
+                return Ok(spotify_payload);
+            }
+
             let ordered_candidates = self
                 .search_candidates_for_track(&track, settings.preferred_provider.as_str())
                 .await?;
@@ -80,9 +87,7 @@ impl LyricsDomain {
                 }
             }
 
-            return self
-                .spotify_or_unmatched(Some(track_uri), Some(track.id.as_str()))
-                .await;
+            return Ok(spotify_payload);
         }
 
         self.spotify_or_unmatched(Some(track_uri), fallback_track_id.as_deref())
@@ -302,6 +307,10 @@ impl LyricsDomain {
             Err(error) => Err(error),
         }
     }
+}
+
+fn is_usable_spotify_lyrics(payload: &LyricsPayload) -> bool {
+    payload.source == "spotify" && has_usable_lyrics(payload)
 }
 
 fn empty_lyrics_payload(

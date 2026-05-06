@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::time::Instant;
 
-const MAX_SNAPSHOT_BACKWARD_DRIFT_MS: i64 = 1_500;
+const MAX_SNAPSHOT_BACKWARD_DRIFT_MS: i64 = 250;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PositionClock {
@@ -66,12 +66,9 @@ impl PositionClock {
         let current = self.estimate();
         let continuous_playback = self.is_playing && is_playing;
         let backward_snapshot = current > position_ms;
-        let large_backward_seek = self
-            .last_snapshot_position_ms
-            .map(|previous| previous - position_ms > MAX_SNAPSHOT_BACKWARD_DRIFT_MS)
-            .unwrap_or(false);
-        let stale_backward_snapshot =
-            continuous_playback && backward_snapshot && !large_backward_seek;
+        let stale_backward_snapshot = continuous_playback
+            && backward_snapshot
+            && self.is_stale_backward_snapshot(current, position_ms);
         let stable = if stale_backward_snapshot {
             current
         } else {
@@ -82,6 +79,19 @@ impl PositionClock {
         } else {
             stable
         }
+    }
+
+    fn is_stale_backward_snapshot(&self, current_ms: i64, snapshot_ms: i64) -> bool {
+        let Some(previous_snapshot_ms) = self.last_snapshot_position_ms else {
+            return current_ms - snapshot_ms <= MAX_SNAPSHOT_BACKWARD_DRIFT_MS;
+        };
+        if previous_snapshot_ms - snapshot_ms > MAX_SNAPSHOT_BACKWARD_DRIFT_MS {
+            return false;
+        }
+        if snapshot_ms <= previous_snapshot_ms {
+            return true;
+        }
+        current_ms - snapshot_ms <= MAX_SNAPSHOT_BACKWARD_DRIFT_MS
     }
 
     pub fn is_playing(&self) -> bool {
@@ -209,6 +219,21 @@ mod tests {
         assert!(
             after >= before - 5,
             "repeated stale snapshots should not rewind playback, before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn playing_snapshot_accepts_spotify_backward_correction_over_drift_limit() {
+        let mut clock = PositionClock::default();
+        clock.snapshot(10_000, 60_000, true);
+        clock.baseline_at = Some(Instant::now() - std::time::Duration::from_millis(520));
+
+        clock.snapshot(10_200, 60_000, true);
+        let estimate = clock.estimate();
+
+        assert!(
+            (10_200..=10_260).contains(&estimate),
+            "Spotify corrections beyond the small jitter window should be accepted, got {estimate}"
         );
     }
 }

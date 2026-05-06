@@ -54,15 +54,15 @@ pub fn apply_timing_offset(payload: &LyricsPayload, offset_ms: i32) -> LyricsPay
             .map(|line| LyricsLine {
                 text: line.text.clone(),
                 translated_text: line.translated_text.clone(),
-                start_time_ms: line.start_time_ms + normalized_offset,
-                end_time_ms: line.end_time_ms + normalized_offset,
+                start_time_ms: line.start_time_ms - normalized_offset,
+                end_time_ms: line.end_time_ms - normalized_offset,
                 words: line
                     .words
                     .iter()
                     .map(|word| LyricsWord {
                         text: word.text.clone(),
-                        start_time_ms: word.start_time_ms + normalized_offset,
-                        end_time_ms: word.end_time_ms + normalized_offset,
+                        start_time_ms: word.start_time_ms - normalized_offset,
+                        end_time_ms: word.end_time_ms - normalized_offset,
                     })
                     .collect(),
             })
@@ -355,5 +355,59 @@ mod tests {
             normalize_search_query("神っぽいな／God-ish【English ver.】"),
             "神っぽいな God ish English ver"
         );
+    }
+
+    #[test]
+    fn positive_timing_offset_makes_external_lyrics_appear_earlier() {
+        let payload = LyricsPayload {
+            track_uri: None,
+            track_id: Some("track-1".into()),
+            language: None,
+            provider: Some("netease".into()),
+            source: "netease".into(),
+            sync_type: "line".into(),
+            lines: vec![LyricsLine {
+                text: "Line one".into(),
+                translated_text: None,
+                start_time_ms: 1_000,
+                end_time_ms: 2_000,
+                words: vec![LyricsWord {
+                    text: "Line".into(),
+                    start_time_ms: 1_000,
+                    end_time_ms: 1_400,
+                }],
+            }],
+        };
+
+        let shifted = apply_timing_offset(&payload, 250);
+
+        assert_eq!(shifted.lines[0].start_time_ms, 750);
+        assert_eq!(shifted.lines[0].end_time_ms, 1_750);
+        assert_eq!(shifted.lines[0].words[0].start_time_ms, 750);
+        assert_eq!(shifted.lines[0].words[0].end_time_ms, 1_150);
+    }
+
+    #[test]
+    fn negative_timing_offset_makes_external_lyrics_appear_later() {
+        let payload = LyricsPayload {
+            track_uri: None,
+            track_id: Some("track-1".into()),
+            language: None,
+            provider: Some("qq".into()),
+            source: "qq".into(),
+            sync_type: "line".into(),
+            lines: vec![LyricsLine {
+                text: "Line one".into(),
+                translated_text: None,
+                start_time_ms: 1_000,
+                end_time_ms: 2_000,
+                words: Vec::new(),
+            }],
+        };
+
+        let shifted = apply_timing_offset(&payload, -250);
+
+        assert_eq!(shifted.lines[0].start_time_ms, 1_250);
+        assert_eq!(shifted.lines[0].end_time_ms, 2_250);
     }
 }
