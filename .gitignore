@@ -9,3 +9,5 @@ spot-lyric-gtk/data/gschemas.compiled
 .idea/
 .vscode/
 .cursor/
+.trellis
+AGENTS.md
