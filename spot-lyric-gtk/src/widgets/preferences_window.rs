@@ -1050,6 +1050,8 @@ fn auth_snapshot_has_account_identity(snapshot: &AuthSnapshot) -> bool {
 
 // ─── helper: bridge UI updates from std::mpsc into preference window calls ──
 
+const UI_DISPATCH_INTERVAL_MS: u64 = 50;
+
 pub fn install_ui_dispatcher(
     window: &PreferencesWindow,
     rx: std_mpsc::Receiver<crate::bridge::UiUpdate>,
@@ -1060,9 +1062,12 @@ pub fn install_ui_dispatcher(
     use crate::bridge::UiUpdate;
     let win_weak = window.downgrade();
     let rx = std::cell::RefCell::new(rx);
-    glib::source::idle_add_local(
+    glib::source::timeout_add_local(
+        std::time::Duration::from_millis(UI_DISPATCH_INTERVAL_MS),
         clone!(@strong desktop, @strong tray_state, @strong tray_handle => move || {
-            // Drain quickly per idle tick.
+            // Drain quickly when the timer fires. An idle source that keeps
+            // returning Continue runs whenever GTK is otherwise idle and can
+            // spin the main thread at 100% CPU when there are no updates.
             while let Ok(update) = rx.borrow_mut().try_recv() {
                 let Some(win) = win_weak.upgrade() else {
                     return glib::ControlFlow::Break;

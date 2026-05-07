@@ -64,21 +64,6 @@ window {
   opacity: 0.85;
 }
 
-.drag-handle {
-  min-width: 96px;
-  min-height: 22px;
-  border-radius: 999px;
-  background-color: alpha(white, 0.18);
-  margin-top: 8px;
-  padding: 2px 12px;
-}
-
-.drag-handle-label {
-  color: alpha(white, 0.72);
-  font-size: 0.78em;
-  font-weight: 700;
-}
-
 /* ─── Lyrics match dialog ─── */
 .lyrics-match-row {
   padding: 6px 4px;

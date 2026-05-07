@@ -36,7 +36,6 @@ struct Atoms {
     net_wm_window_type: u32,
     net_wm_window_type_utility: u32,
     net_wm_desktop: u32,
-    net_wm_moveresize: u32,
     net_moveresize_window: u32,
     net_wm_pid: u32,
     wm_class: u32,
@@ -60,7 +59,6 @@ impl Atoms {
             net_wm_window_type: one(conn, "_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_utility: one(conn, "_NET_WM_WINDOW_TYPE_UTILITY")?,
             net_wm_desktop: one(conn, "_NET_WM_DESKTOP")?,
-            net_wm_moveresize: one(conn, "_NET_WM_MOVERESIZE")?,
             net_moveresize_window: one(conn, "_NET_MOVERESIZE_WINDOW")?,
             net_wm_pid: one(conn, "_NET_WM_PID")?,
             wm_class: u32::from(AtomEnum::WM_CLASS),
@@ -253,38 +251,6 @@ impl X11Helper {
         Ok(())
     }
 
-    /// Ask the window manager to start an interactive move operation.
-    ///
-    /// Cinnamon/Muffin handles `_NET_WM_MOVERESIZE` more reliably for
-    /// undecorated utility windows than direct coordinate moves.
-    pub fn begin_interactive_move(&self, xid: u32, button: u32) -> Result<()> {
-        const _NET_WM_MOVERESIZE_MOVE: u32 = 8;
-        const SOURCE_APPLICATION: u32 = 1;
-
-        let conn = &*self.conn;
-        let pointer = conn.query_pointer(self.root)?.reply()?;
-        let event = ClientMessageEvent::new(
-            32,
-            xid,
-            self.atoms.net_wm_moveresize,
-            [
-                pointer.root_x as i32 as u32,
-                pointer.root_y as i32 as u32,
-                _NET_WM_MOVERESIZE_MOVE,
-                button.max(1),
-                SOURCE_APPLICATION,
-            ],
-        );
-        conn.send_event(
-            false,
-            self.root,
-            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-            event,
-        )?;
-        conn.flush()?;
-        Ok(())
-    }
-
     /// Move window to absolute screen coordinates.
     pub fn move_window(&self, xid: u32, x: i32, y: i32) -> Result<()> {
         self.move_resize_window_inner(xid, x, y, None)
@@ -377,12 +343,6 @@ impl X11Helper {
             width: geometry.width as i32,
             height: geometry.height as i32,
         })
-    }
-
-    /// Current pointer position in root coordinates.
-    pub fn pointer_position(&self) -> Result<(i32, i32)> {
-        let pointer = self.conn.query_pointer(self.root)?.reply()?;
-        Ok((pointer.root_x as i32, pointer.root_y as i32))
     }
 
     /// Best-effort primary monitor geometry.
